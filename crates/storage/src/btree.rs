@@ -1964,7 +1964,8 @@ impl BTree {
     /// supplied path so subsequent `save()` calls hit the same file.
     ///
     /// Guards against corrupted or maliciously large files: rejects files
-    /// larger than 512MB and node counts above 10 million.
+    /// larger than 512MB and node counts above 10 million. Serialized counts
+    /// must fit the remaining bytes before they can reserve vector capacity.
     pub fn load(path: &Path) -> io::Result<Self> {
         let mut f = fs::File::open(path)?;
         let file_size = f.metadata()?.len();
@@ -2031,17 +2032,29 @@ impl BTree {
             ));
         }
 
+        // Even an empty leaf needs a tag, key count and next-leaf flag.
+        check_serialized_count(n_nodes, 6, buf.len() - pos, "node")?;
         let mut nodes: Vec<Node> = Vec::with_capacity(n_nodes);
         for _ in 0..n_nodes {
             let tag = read_u8(&buf, &mut pos)?;
             match tag {
                 NODE_TAG_INTERNAL => {
                     let n_keys = read_u32(&buf, &mut pos)? as usize;
+                    // Every Value has at least a type tag. Reserve space for
+                    // the child-count field as well; do not impose a new order
+                    // or fanout restriction on previously valid files.
+                    check_serialized_count(
+                        n_keys,
+                        1,
+                        (buf.len() - pos).saturating_sub(4),
+                        "internal key",
+                    )?;
                     let mut keys = Vec::with_capacity(n_keys);
                     for _ in 0..n_keys {
                         keys.push(read_value(&buf, &mut pos)?);
                     }
                     let n_children = read_u32(&buf, &mut pos)? as usize;
+                    check_serialized_count(n_children, 4, buf.len() - pos, "child")?;
                     let mut children = Vec::with_capacity(n_children);
                     for _ in 0..n_children {
                         children.push(read_u32(&buf, &mut pos)? as usize);
@@ -2050,6 +2063,13 @@ impl BTree {
                 }
                 NODE_TAG_LEAF => {
                     let n_keys = read_u32(&buf, &mut pos)? as usize;
+                    // A key's tag plus its six-byte RID, then the next flag.
+                    check_serialized_count(
+                        n_keys,
+                        7,
+                        (buf.len() - pos).saturating_sub(1),
+                        "leaf key",
+                    )?;
                     let mut keys = Vec::with_capacity(n_keys);
                     for _ in 0..n_keys {
                         keys.push(read_value(&buf, &mut pos)?);
@@ -2151,6 +2171,24 @@ impl BTree {
     }
 }
 
+fn check_serialized_count(
+    count: usize,
+    minimum_bytes: usize,
+    remaining: usize,
+    name: &str,
+) -> io::Result<()> {
+    // Division avoids multiplying an untrusted count (and overflowing) before
+    // validation. This bounds eager reservations by the actual encoded input;
+    // it is not a process-wide memory allowance for otherwise valid files.
+    if count > remaining / minimum_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("btree {name} count exceeds remaining file size"),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct ReverseKeyGroup {
     current_key: Option<Value>,
@@ -2225,7 +2263,7 @@ fn read_value(buf: &[u8], pos: &mut usize) -> io::Result<Value> {
         }
         TypeId::Str => {
             let n = read_u32(buf, pos)? as usize;
-            if *pos + n > buf.len() {
+            if n > buf.len().saturating_sub(*pos) {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "truncated btree str",
@@ -2255,7 +2293,7 @@ fn read_value(buf: &[u8], pos: &mut usize) -> io::Result<Value> {
         }
         TypeId::Bytes => {
             let n = read_u32(buf, pos)? as usize;
-            if *pos + n > buf.len() {
+            if n > buf.len().saturating_sub(*pos) {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "truncated btree bytes",
@@ -2267,7 +2305,7 @@ fn read_value(buf: &[u8], pos: &mut usize) -> io::Result<Value> {
         }
         TypeId::Json => {
             let n = read_u32(buf, pos)? as usize;
-            if *pos + n > buf.len() {
+            if n > buf.len().saturating_sub(*pos) {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "truncated btree json",

@@ -3,6 +3,12 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
+> **Next release: v0.29.1 (unreleased).** Faster selective membership reads,
+> lower point-query and filtered-count overhead, and eligible multiaggregate
+> queries that complete within the existing memory allowance. No public API,
+> wire-format, disk-format, or default durability change. Publication is pending;
+> the current published version remains v0.29.0.
+
 > **Current release: v0.29.0.** Safer failed writes, offline integrity checks and
 > restore drills, and lower rollback-protection overhead. A failed statement in
 > an explicit transaction now requires `ROLLBACK`; uncertain commits must be

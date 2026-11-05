@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.1] - 2026-11-04
+
+This patch makes eligible indexed membership queries and aggregate reports do
+less work, without changing query results, stored formats, or default durability.
+
+### Performance
+
+- Selective indexed `IN` filters use bounded, deduplicated index probes instead
+  of scanning the table. In the fixed million-row recovery fixture, mutable and
+  read-only queries return the exact 140 matching IDs in about 0.9 ms instead of
+  about 785 ms. Broad lists, unsupported shapes, overflow tables, and mutations
+  keep their existing execution paths.
+- Eligible constant-group fixed-width multiaggregates share a streaming scan.
+  The million-row four-aggregate fixture now completes in about 86–89 ms instead
+  of exceeding the unchanged 256 MiB query memory allowance. This does not yet
+  cover general filtered/grouped, DISTINCT, or join-provenance aggregates.
+- Indexed projections avoid repeated schema-name cloning, single-integer
+  filters specialize their comparison once, and integer scalar aggregates keep
+  only the state they need. Same-instance hosted measurements show 15.8% lower
+  point-query latency and 21.4% lower filtered-count latency; integer SUM/MIN/MAX
+  improve by about 2–3% in that run.
+
+These are scoped read-workload observations, not universal latency promises or
+competitor rankings. All 22 absolute and same-instance checks and all four
+ratio gates pass without relaxed thresholds. The legacy microbenchmarks disable
+WAL and do not establish durable-write throughput. See the
+[paired performance gate](https://github.com/ZVN-DEV/powdb/actions/runs/41841028314)
+and [recovery methodology](docs/benchmarks/query-recovery.md).
+
+### Security and compatibility
+
+- Reject impossible index node, key and child counts before reserving memory.
+  This prevents tiny malformed index files with valid checksums from driving
+  multi-gigabyte allocations during open. Recovered fuzz cases are retained in
+  the deterministic replay corpus; valid index formats remain unchanged.
+- Refresh compatible TLS, certificate-root, constant-time utility, and optional
+  comparison-tool compression dependencies to patched versions.
+- Public Rust and JavaScript APIs, wire and disk formats, transaction failure
+  handling, cancellation, overflow validation, and default durability/memory
+  settings are unchanged. Existing 0.29.0 migration requirements still apply.
+
 ## [0.29.0] - 2026-10-08
 
 This update protects failed writes, adds offline integrity checks and restore

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.29.1 - 2026-11-04
+
+No client API or wire-protocol changes. The version tracks the engine patch,
+which speeds up eligible indexed membership reads, point queries and filtered
+counts, and lets eligible multiaggregate reports finish within the existing
+memory allowance. Upgrade the server to receive these engine improvements.
+
 ## 0.29.0 - 2026-10-08
 
 ### Changed
