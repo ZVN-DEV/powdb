@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- Eligible unindexed integer-literal `IN` and `NOT IN` filters compile their
+  membership set once and skip repeated row decoding during scans. Lists remain
+  bounded; other types and unsupported shapes retain existing paths. Native
+  paired and allocation gates cover both execution surfaces; this does not add
+  SQL `IN` syntax or avoid visiting an unindexed query's input rows.
+
 ## [0.29.1] - 2026-11-04
 
 This patch makes eligible indexed membership queries and aggregate reports do

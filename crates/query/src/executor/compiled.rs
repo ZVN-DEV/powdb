@@ -197,6 +197,14 @@ enum CompiledLeaf {
         op: BinOp,
         literal: i64,
     },
+    /// A bounded integer-literal membership set over an Int column.
+    IntIn {
+        data_offset: usize,
+        bitmap_byte: usize,
+        bitmap_bit: u8,
+        keys: Vec<i64>,
+        negated: bool,
+    },
     /// `.field <op> literal_float` (or reversed), where `.field` is a
     /// Float column. Int literals that bound a Float column (e.g.
     /// `.price > 100` on `price: float`) are also routed here, promoted
@@ -270,14 +278,22 @@ impl CompiledLeaf {
     /// Evaluate this leaf against a row's raw bytes. `#[inline]` so the
     /// match folds into the caller's tight loop with LTO.
     #[inline]
-    fn eval(&self, data: &[u8]) -> bool {
-        let base = if data.len() >= ROW_PREFIX_SIZE && &data[0..4] == ROW_MAGIC {
+    fn eval(&self, encoded: &[u8]) -> bool {
+        let base = if encoded.len() >= ROW_PREFIX_SIZE && &encoded[0..4] == ROW_MAGIC {
             ROW_PREFIX_SIZE
         } else {
             0
         };
-        let data = &data[base..];
+        let data = &encoded[base..];
         match self {
+            CompiledLeaf::IntIn {
+                data_offset,
+                bitmap_byte,
+                bitmap_bit,
+                keys,
+                negated,
+            } => compiled_int_value(encoded, *data_offset, *bitmap_byte, *bitmap_bit)
+                .is_some_and(|value| keys.binary_search(&value).is_ok() != *negated),
             CompiledLeaf::Int {
                 data_offset,
                 bitmap_byte,
@@ -777,6 +793,16 @@ fn flatten_and_compile(
             }
             None
         }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            out.push(build_int_membership_leaf(
+                expr, list, *negated, columns, layout, schema,
+            )?);
+            Some(())
+        }
         Expr::UnaryOp(op, inner) if *op == UnaryOp::IsNull || *op == UnaryOp::IsNotNull => {
             if let Expr::Field(name) = inner.as_ref() {
                 let col_idx = columns.iter().position(|c| c == name)?;
@@ -795,6 +821,47 @@ fn flatten_and_compile(
         }
         _ => None,
     }
+}
+
+fn build_int_membership_leaf(
+    expr: &Expr,
+    list: &[Expr],
+    negated: bool,
+    columns: &[String],
+    layout: &FastLayout,
+    schema: &Schema,
+) -> Option<CompiledLeaf> {
+    let Expr::Field(name) = expr else {
+        return None;
+    };
+    // Bound compilation state before allocation, including duplicate-heavy
+    // lists. Other types retain the generic cross-type comparison semantics.
+    if list.len() > 128 {
+        return None;
+    }
+    let column = columns.iter().position(|c| c == name)?;
+    if schema.columns[column].type_id != TypeId::Int {
+        return None;
+    }
+    let mut keys = Vec::with_capacity(list.len());
+    for item in list {
+        match item {
+            Expr::Literal(Literal::Int(value)) => keys.push(*value),
+            // In filter mode null never equals a non-null integer. A null
+            // tested field is rejected by compiled_int_value even for NOT IN.
+            Expr::Null => {}
+            _ => return None,
+        }
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    Some(CompiledLeaf::IntIn {
+        data_offset: 2 + layout.bitmap_size + layout.fixed_offsets[column]?,
+        bitmap_byte: column / 8,
+        bitmap_bit: (column % 8) as u8,
+        keys,
+        negated,
+    })
 }
 
 /// Build an `Int` leaf from `.field <op> literal_int` (or reversed).
@@ -1146,6 +1213,127 @@ pub(super) fn decode_selective(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn membership_schema() -> Schema {
+        Schema {
+            table_name: "Numbers".into(),
+            columns: (0..9)
+                .map(|position| ColumnDef {
+                    name: format!("c{position}"),
+                    type_id: if position == 0 {
+                        TypeId::Str
+                    } else {
+                        TypeId::Int
+                    },
+                    required: false,
+                    position,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn integer_membership_matches_generic_across_formats_and_conjunctions() {
+        use powdb_storage::row::encode_row_v2_into;
+        let schema = membership_schema();
+        let columns: Vec<_> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        let fast = FastLayout::new(&schema);
+        let layout = RowLayout::new(&schema);
+        for list in [
+            vec![],
+            vec![Expr::Null],
+            vec![lit_int(1), lit_int(1), Expr::Null],
+            vec![lit_int(i64::MIN), lit_int(-1), lit_int(i64::MAX)],
+            (0..128).map(lit_int).collect(),
+        ] {
+            for negated in [false, true] {
+                for conjunction in [false, true] {
+                    let membership = Expr::InList {
+                        expr: Box::new(Expr::Field("c8".into())),
+                        list: list.clone(),
+                        negated,
+                    };
+                    let expr = if conjunction {
+                        cmp(
+                            membership,
+                            BinOp::And,
+                            cmp(Expr::Field("c1".into()), BinOp::Gt, lit_int(0)),
+                        )
+                    } else {
+                        membership
+                    };
+                    let compiled = compile_predicate(&expr, &columns, &fast, &schema)
+                        .expect("bounded integer membership must compile");
+                    for input in [
+                        None,
+                        Some(i64::MIN),
+                        Some(-1),
+                        Some(0),
+                        Some(1),
+                        Some(i64::MAX),
+                    ] {
+                        for other in [-1, 1] {
+                            let mut row = vec![Value::Int(42); 9];
+                            row[0] = Value::Str("inline".into());
+                            row[1] = Value::Int(other);
+                            row[8] = input.map(Value::Int).unwrap_or(Value::Empty);
+                            let expected =
+                                super::super::eval::eval_predicate(&expr, &row, &columns);
+                            let v1 = encode_row(&schema, &row);
+                            let legacy = v1[ROW_PREFIX_SIZE..].to_vec();
+                            let mut v2 = Vec::new();
+                            encode_row_v2_into(
+                                &schema,
+                                &layout,
+                                &row,
+                                &vec![None; layout.n_var()],
+                                &mut v2,
+                            );
+                            for bytes in [&legacy, &v1, &v2] {
+                                assert_eq!(
+                                    compiled(bytes),
+                                    expected,
+                                    "{expr:?}, {input:?}, other={other}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn integer_membership_declines_unsupported_or_unbounded_shapes() {
+        let mut schema = membership_schema();
+        let columns: Vec<_> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        for list in [
+            vec![lit_float(1.0)],
+            vec![lit_int(1), lit_str("1")],
+            vec![Expr::Field("c1".into())],
+            vec![lit_int(1); 129],
+        ] {
+            let expr = Expr::InList {
+                expr: Box::new(Expr::Field("c8".into())),
+                list,
+                negated: false,
+            };
+            assert!(
+                compile_predicate(&expr, &columns, &FastLayout::new(&schema), &schema).is_none()
+            );
+        }
+        let expr = Expr::InList {
+            expr: Box::new(Expr::Field("c8".into())),
+            list: vec![lit_int(1)],
+            negated: false,
+        };
+        for kind in [TypeId::Float, TypeId::DateTime, TypeId::Bool, TypeId::Str] {
+            schema.columns[8].type_id = kind;
+            assert!(
+                compile_predicate(&expr, &columns, &FastLayout::new(&schema), &schema).is_none()
+            );
+        }
+    }
 
     #[test]
     fn single_int_operator_specialization_matches_generic_across_formats() {
