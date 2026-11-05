@@ -1,0 +1,99 @@
+name: query recovery
+
+on:
+  # Exercise the evaluator itself before its first merge. Engine-only changes
+  # can use workflow_dispatch once this workflow exists on the default branch.
+  pull_request:
+    paths:
+      - .github/workflows/query-recovery.yml
+      - crates/bench/src/bin/query_recovery_gate.rs
+  workflow_dispatch:
+    inputs:
+      control_ref:
+        description: Released engine revision used as the fixed control
+        required: true
+        default: 7cc4b548ac94d9379aa362c3121314b8c2479039
+
+permissions:
+  contents: read
+
+jobs:
+  recovery:
+    name: paired million-row query recovery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      RUSTFLAGS: -C target-cpu=x86-64-v2
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: candidate
+          persist-credentials: false
+      - name: Checkout control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: control
+          ref: ${{ inputs.control_ref || '7cc4b548ac94d9379aa362c3121314b8c2479039' }}
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            candidate -> target
+            control -> target
+          shared-key: query-recovery
+      - name: Install identical evaluator in both trees
+        run: |
+          set -euo pipefail
+          test "$(git -C candidate rev-parse HEAD)" != "$(git -C control rev-parse HEAD)"
+          # Examples use the existing tempfile dev dependency in both revisions.
+          # Only the evaluator is copied; control engine sources stay untouched.
+          for tree in candidate control; do
+            mkdir -p "$tree/crates/bench/examples"
+            cp candidate/crates/bench/src/bin/query_recovery_gate.rs \
+              "$tree/crates/bench/examples/query_recovery_gate.rs"
+          done
+          cmp candidate/crates/bench/examples/query_recovery_gate.rs \
+            control/crates/bench/examples/query_recovery_gate.rs
+      - name: Build both before timing
+        run: |
+          set -euo pipefail
+          (cd control && cargo build --release --locked -p powdb-bench --example query_recovery_gate)
+          (cd candidate && cargo build --release --locked -p powdb-bench --example query_recovery_gate)
+      - name: Record provenance
+        run: |
+          set -euo pipefail
+          {
+            rustc --version
+            git -C candidate rev-parse HEAD
+            git -C control rev-parse HEAD
+            uname -m
+            printenv RUSTFLAGS
+            lscpu
+            free -b
+            df -h "$GITHUB_WORKSPACE"
+            sha256sum candidate/crates/bench/src/bin/query_recovery_gate.rs \
+              control/target/release/examples/query_recovery_gate \
+              candidate/target/release/examples/query_recovery_gate
+          } > provenance.txt
+      - name: Run five alternating paired rounds
+        run: |
+          set -euo pipefail
+          export POWDB_QUERY_RECOVERY_BASELINE="$GITHUB_WORKSPACE/control/target/release/examples/query_recovery_gate"
+          candidate/target/release/examples/query_recovery_gate \
+            --rows 1000000 --repetitions 5 > query-recovery.json
+      - name: Upload complete evaluator evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: query-recovery
+          path: |
+            query-recovery.json
+            provenance.txt
+          if-no-files-found: error
+          retention-days: 30

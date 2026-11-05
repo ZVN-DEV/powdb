@@ -127,7 +127,31 @@ impl Engine {
         // with-pred / no-pred split can't drift between variants.
         let result = match col_type {
             TypeId::Int => match function {
-                AggFunc::Sum | AggFunc::Avg => {
+                AggFunc::Sum => {
+                    // SUM needs only presence, not AVG's per-row count. Keep
+                    // the wide total until finalization so cancellation of
+                    // intermediate i64 overflow remains valid.
+                    let mut sum_i128: i128 = 0;
+                    let mut seen = false;
+                    agg_int_loop!(
+                        self,
+                        table,
+                        compiled_pred,
+                        bitmap_byte,
+                        bitmap_bit,
+                        body_data_offset,
+                        |v: i64| {
+                            seen = true;
+                            sum_i128 += v as i128;
+                        }
+                    );
+                    QueryResult::Scalar(if seen {
+                        Value::Int(i64::try_from(sum_i128).map_err(|_| agg_overflow_error("sum"))?)
+                    } else {
+                        Value::Empty
+                    })
+                }
+                AggFunc::Avg => {
                     let mut sum_i128: i128 = 0;
                     let mut count: i64 = 0;
                     agg_int_loop!(
@@ -142,21 +166,7 @@ impl Engine {
                             sum_i128 += v as i128;
                         }
                     );
-                    if matches!(function, AggFunc::Sum) {
-                        if count == 0 {
-                            // No numeric row contributed: Empty (SQL NULL),
-                            // matching avg and the generic NumericAgg::sum.
-                            QueryResult::Scalar(Value::Empty)
-                        } else {
-                            // Clamping to i64::MAX here used to report a
-                            // plausible number for a total that never
-                            // happened. The generic paths raise the same
-                            // error via `NumericAgg::sum`.
-                            let total =
-                                i64::try_from(sum_i128).map_err(|_| agg_overflow_error("sum"))?;
-                            QueryResult::Scalar(Value::Int(total))
-                        }
-                    } else if count == 0 {
+                    if count == 0 {
                         QueryResult::Scalar(Value::Empty)
                     } else {
                         let avg = (sum_i128 as f64) / (count as f64);
@@ -164,7 +174,10 @@ impl Engine {
                     }
                 }
                 AggFunc::Min => {
-                    let mut min_v: Option<i64> = None;
+                    // Presence is independent of the sentinel: i64::MAX is
+                    // itself a valid non-null minimum.
+                    let mut min_v = i64::MAX;
+                    let mut seen = false;
                     agg_int_loop!(
                         self,
                         table,
@@ -173,16 +186,19 @@ impl Engine {
                         bitmap_bit,
                         body_data_offset,
                         |v: i64| {
-                            min_v = Some(match min_v {
-                                Some(m) => m.min(v),
-                                None => v,
-                            });
+                            seen = true;
+                            min_v = min_v.min(v);
                         }
                     );
-                    QueryResult::Scalar(min_v.map(Value::Int).unwrap_or(Value::Empty))
+                    QueryResult::Scalar(if seen {
+                        Value::Int(min_v)
+                    } else {
+                        Value::Empty
+                    })
                 }
                 AggFunc::Max => {
-                    let mut max_v: Option<i64> = None;
+                    let mut max_v = i64::MIN;
+                    let mut seen = false;
                     agg_int_loop!(
                         self,
                         table,
@@ -191,13 +207,15 @@ impl Engine {
                         bitmap_bit,
                         body_data_offset,
                         |v: i64| {
-                            max_v = Some(match max_v {
-                                Some(m) => m.max(v),
-                                None => v,
-                            });
+                            seen = true;
+                            max_v = max_v.max(v);
                         }
                     );
-                    QueryResult::Scalar(max_v.map(Value::Int).unwrap_or(Value::Empty))
+                    QueryResult::Scalar(if seen {
+                        Value::Int(max_v)
+                    } else {
+                        Value::Empty
+                    })
                 }
                 AggFunc::Count => {
                     let mut count: i64 = 0;
@@ -784,6 +802,50 @@ mod tests {
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
     const HUGE: i64 = 4_000_000_000_000_000_000;
+
+    #[test]
+    fn scalar_int_aggregates_honor_live_cancellation() {
+        use crate::cancel::{CancelReason, ExecCancel};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path()).unwrap();
+        engine.execute_powql("type T { n: int }").unwrap();
+        for n in 0..10_000 {
+            engine
+                .catalog_mut()
+                .get_table_mut("T")
+                .unwrap()
+                .insert(&vec![Value::Int(n)])
+                .unwrap();
+        }
+        for function in [AggFunc::Sum, AggFunc::Min, AggFunc::Max] {
+            let token = Arc::new(ExecCancel::new());
+            token.block_at_checkpoint(2);
+            let observer = Arc::clone(&token);
+            let sender = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while observer.checkpoint_count() < 2 && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                let reached = observer.checkpoint_count() >= 2;
+                observer.cancel(CancelReason::Disconnect);
+                reached
+            });
+            let guard = crate::cancel::install(token);
+            // Direct invocation places both checkpoints inside the scan,
+            // after rows have contributed to the accumulator.
+            let result = engine.agg_single_col_fast("T", "n", function, None);
+            drop(guard);
+            assert!(sender.join().unwrap(), "scan never reached its checkpoint");
+            assert!(matches!(result, Err(QueryError::Cancelled)), "{result:?}");
+        }
+        assert!(matches!(
+            engine.execute_powql("sum(T { .n })").unwrap(),
+            QueryResult::Scalar(Value::Int(49_995_000))
+        ));
+    }
 
     /// Three rows whose int total (1.2e19) is well past `i64::MAX`, plus a
     /// str column the compiled aggregate path always declines.

@@ -138,15 +138,12 @@ jobs:
           # `nightly-pin-freshness` job below fails as soon as this pin passes
           # 45 days, so the pin cannot rot silently.
           #
-          # Moved 2026-09-06. The previous pin (nightly-2026-07-22) hit 46 days
-          # and did exactly that: the 2026-09-06 nightly run failed on the
-          # freshness check. The reason for the old pin is gone -- the
-          # rustc_codegen_ssa ICE on tokio in nightly-2026-07-23 is six weeks
-          # behind us -- so this moves forward instead of re-floating.
-          # nightly-2026-09-01 is rustc 1.100.0-nightly (0dfb098f3) and builds
-          # all 11 fuzz targets under ASan. When this expires, move it forward
-          # again and restate the reason; do not raise MAX_PIN_AGE_DAYS.
-          toolchain: nightly-2026-09-01
+          # Refreshed 2026-11-04. Nov 1 hits the recursive async-drop compiler
+          # regression in https://github.com/rust-lang/rust/issues/165263 and
+          # https://github.com/rust-lang/rust/issues/165306 on PowDB's Expr.
+          # Oct 31 is the upstream reproducer's preceding known-good nightly.
+          # Keep replay synchronized and the 45-day freshness guard unchanged.
+          toolchain: nightly-2026-10-31
 
       - name: Cargo cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -195,7 +192,7 @@ jobs:
       # hashFiles() of it, deriving a key from a file the build ignored.
       - name: Verify the checked-in fuzz lockfile is current
         working-directory: crates/query/fuzz
-        run: cargo +nightly-2026-09-01 metadata --locked --format-version 1 > /dev/null
+        run: cargo +nightly-2026-10-31 metadata --locked --format-version 1 > /dev/null
 
       # `cargo fuzz` expects `<crate>/fuzz/Cargo.toml` relative to its cwd,
       # so we run from `crates/query` (the crate under test), not from

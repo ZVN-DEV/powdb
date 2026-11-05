@@ -139,6 +139,27 @@ impl FastLayout {
 
 pub(super) type CompiledPredicate = Box<dyn Fn(&[u8]) -> bool>;
 
+#[inline]
+fn compiled_int_value(
+    data: &[u8],
+    offset: usize,
+    bitmap_byte: usize,
+    bitmap_bit: u8,
+) -> Option<i64> {
+    let base = if data.len() >= ROW_PREFIX_SIZE && &data[..4] == ROW_MAGIC {
+        ROW_PREFIX_SIZE
+    } else {
+        0
+    };
+    let body = &data[base..];
+    if (body.get(2 + bitmap_byte)? >> bitmap_bit) & 1 != 0 {
+        return None;
+    }
+    Some(i64::from_le_bytes(
+        body.get(offset..offset + 8)?.try_into().ok()?,
+    ))
+}
+
 /// Map an f64 bit pattern to a u64 that orders under unsigned integer
 /// comparison the same way `f64::total_cmp` orders the floats. Classic
 /// sortable-float transform:
@@ -669,6 +690,36 @@ pub(super) fn compile_predicate(
             .into_iter()
             .next()
             .expect("leaves.len() == 1 checked above");
+        if let CompiledLeaf::Int {
+            data_offset,
+            bitmap_byte,
+            bitmap_bit,
+            op,
+            literal,
+        } = leaf
+        {
+            // Select the operator once, so the row loop has neither an enum
+            // dispatch nor an operator match. Keep the v2 decoder fallback.
+            macro_rules! comparison {
+                ($operator:tt) => {
+                    Box::new(move |data: &[u8]| {
+                        if row_is_v2(data) { return fallback(data); }
+                        compiled_int_value(data, data_offset, bitmap_byte, bitmap_bit)
+                            .is_some_and(|value| value $operator literal)
+                    })
+                };
+            }
+            let specialized: CompiledPredicate = match op {
+                BinOp::Eq => comparison!(==),
+                BinOp::Neq => comparison!(!=),
+                BinOp::Lt => comparison!(<),
+                BinOp::Gt => comparison!(>),
+                BinOp::Lte => comparison!(<=),
+                BinOp::Gte => comparison!(>=),
+                _ => return None,
+            };
+            return Some(specialized);
+        }
         return Some(Box::new(move |data: &[u8]| {
             if row_is_v2(data) {
                 fallback(data)
@@ -1095,6 +1146,125 @@ pub(super) fn decode_selective(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_int_operator_specialization_matches_generic_across_formats() {
+        use powdb_storage::row::{encode_row_v2_into, ROW_PREFIX_SIZE};
+        for target_type in [TypeId::Int, TypeId::DateTime] {
+            let schema = Schema {
+                table_name: "Numbers".into(),
+                columns: (0..9)
+                    .map(|position| ColumnDef {
+                        name: format!("c{position}"),
+                        type_id: if position == 0 {
+                            TypeId::Str
+                        } else if position == 8 {
+                            target_type
+                        } else {
+                            TypeId::Int
+                        },
+                        required: false,
+                        position,
+                    })
+                    .collect(),
+            };
+            let columns: Vec<_> = schema.columns.iter().map(|c| c.name.clone()).collect();
+            let fast = FastLayout::new(&schema);
+            let layout = RowLayout::new(&schema);
+            for op in [
+                BinOp::Eq,
+                BinOp::Neq,
+                BinOp::Lt,
+                BinOp::Gt,
+                BinOp::Lte,
+                BinOp::Gte,
+            ] {
+                for literal in [i64::MIN, -1, 0, 1, i64::MAX] {
+                    for reversed in [false, true] {
+                        let field = Expr::Field("c8".into());
+                        let value = Expr::Literal(Literal::Int(literal));
+                        let (left, right) = if reversed {
+                            (value, field)
+                        } else {
+                            (field, value)
+                        };
+                        let expr = Expr::BinaryOp(Box::new(left), op, Box::new(right));
+                        let compiled = compile_predicate(&expr, &columns, &fast, &schema).unwrap();
+                        for input in [
+                            None,
+                            Some(i64::MIN),
+                            Some(-1),
+                            Some(0),
+                            Some(1),
+                            Some(i64::MAX),
+                        ] {
+                            let mut row = vec![Value::Int(42); 9];
+                            row[0] = Value::Str("inline".into());
+                            row[8] = match input {
+                                None => Value::Empty,
+                                Some(n) if target_type == TypeId::DateTime => Value::DateTime(n),
+                                Some(n) => Value::Int(n),
+                            };
+                            let expected =
+                                super::super::eval::eval_predicate(&expr, &row, &columns);
+                            let v1 = encode_row(&schema, &row);
+                            let legacy = v1[ROW_PREFIX_SIZE..].to_vec();
+                            let mut v2 = Vec::new();
+                            encode_row_v2_into(
+                                &schema,
+                                &layout,
+                                &row,
+                                &vec![None; layout.n_var()],
+                                &mut v2,
+                            );
+                            for bytes in [&v1, &legacy, &v2] {
+                                assert_eq!(
+                                    compiled(bytes),
+                                    expected,
+                                    "{target_type:?}, {expr:?}, {input:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn single_int_specialization_preserves_short_row_checks() {
+        let schema = Schema {
+            table_name: "T".into(),
+            columns: vec![ColumnDef {
+                name: "n".into(),
+                type_id: TypeId::Int,
+                required: false,
+                position: 0,
+            }],
+        };
+        let expr = Expr::BinaryOp(
+            Box::new(Expr::Field("n".into())),
+            BinOp::Gt,
+            Box::new(Expr::Literal(Literal::Int(0))),
+        );
+        let compiled =
+            compile_predicate(&expr, &["n".into()], &FastLayout::new(&schema), &schema).unwrap();
+        let reference = CompiledLeaf::Int {
+            data_offset: 3,
+            bitmap_byte: 0,
+            bitmap_bit: 0,
+            op: BinOp::Gt,
+            literal: 0,
+        };
+        let row = encode_row(&schema, &[Value::Int(1)]);
+        for len in 0..row.len() {
+            assert_eq!(
+                compiled(&row[..len]),
+                reference.eval(&row[..len]),
+                "truncated row length {len}"
+            );
+        }
+    }
 
     #[test]
     fn type_name_to_id_lowercase() {

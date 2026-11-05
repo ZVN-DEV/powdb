@@ -264,6 +264,8 @@ impl Engine {
                 if !tbl.has_index(column) {
                     return Ok(None);
                 }
+                #[cfg(feature = "testing")]
+                crate::executor::work_stats::record_index_probe();
                 let key_value = literal_to_value(key)?;
                 (table.as_str(), tbl.index_lookup_all(column, &key_value))
             }
@@ -310,6 +312,8 @@ impl Engine {
         let mut cancel = CancelCheck::new();
         for rid in rids {
             cancel.tick()?;
+            #[cfg(feature = "testing")]
+            crate::executor::work_stats::record_heap_fetch();
             let Some(sparse) = self
                 .catalog
                 .get_projected(table, rid, &residual_indices)
@@ -318,6 +322,8 @@ impl Engine {
                 continue;
             };
             if eval_predicate(predicate, &sparse, &residual_names) {
+                #[cfg(feature = "testing")]
+                crate::executor::work_stats::record_heap_fetch();
                 if let Some(full) = self
                     .catalog
                     .get(table, rid)

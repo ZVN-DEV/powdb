@@ -105,6 +105,18 @@ pub fn charge(bytes: usize, limit_bytes: usize) -> Result<(), QueryError> {
     })
 }
 
+/// Remaining admission allowance for an additional bounded materialization.
+/// Outside a statement, prior diagnostic charges do not belong to a live query.
+pub(in crate::executor) fn remaining(limit_bytes: usize) -> usize {
+    DEPTH.with(|depth| {
+        if depth.get() == 0 {
+            limit_bytes
+        } else {
+            USED_BYTES.with(|used| limit_bytes.saturating_sub(used.get()))
+        }
+    })
+}
+
 /// Bytes charged so far on the current thread (test/diagnostic helper).
 #[cfg(test)]
 pub fn used() -> usize {
@@ -194,6 +206,24 @@ mod tests {
         // A fresh outermost statement starts clean again.
         let _next = enter();
         assert_eq!(used(), 0, "next outermost statement resets");
+    }
+
+    #[test]
+    fn remaining_tracks_only_active_statement_charges() {
+        reset();
+        assert_eq!(remaining(100), 100);
+        let outer = enter();
+        charge(40, 100).unwrap();
+        assert_eq!(remaining(100), 60);
+        {
+            let _inner = enter();
+            charge(20, 100).unwrap();
+            assert_eq!(remaining(100), 40);
+            assert_eq!(remaining(10), 0);
+        }
+        assert_eq!(remaining(100), 40);
+        drop(outer);
+        assert_eq!(remaining(100), 100);
     }
 
     #[test]

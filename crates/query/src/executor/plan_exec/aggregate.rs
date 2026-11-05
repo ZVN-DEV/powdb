@@ -9,6 +9,197 @@ use crate::executor::mem_budget;
 
 use super::*;
 
+struct StreamingAccumulator {
+    numeric: NumericAgg,
+    count: i64,
+    extreme: Option<Value>,
+}
+
+impl crate::executor::Engine {
+    /// Fold a constant group directly from fixed-width columns. Other shapes
+    /// retain the generic executor, including provenance and distinct state.
+    pub(in crate::executor) fn try_stream_constant_group(
+        &self,
+        input: &PlanNode,
+        keys: &[GroupKey],
+        aggregates: &[GroupAgg],
+        having: &Option<Expr>,
+    ) -> Result<Option<QueryResult>, QueryError> {
+        let PlanNode::SeqScan { table } = input else {
+            return Ok(None);
+        };
+        // The generic scan owns view refresh and readonly escalation.
+        if self.view_registry.is_dirty(table) {
+            return Ok(None);
+        }
+        // The raw visitor rehydrates spilled rows through the legacy row
+        // encoder. Use the strict generic scan for overflow tables instead.
+        if self.catalog.table_has_overflow(table) {
+            return Ok(None);
+        }
+        if keys.len() != 1 || !matches!(keys[0].expr, Expr::Literal(Literal::Int(_))) {
+            return Ok(None);
+        }
+        let schema = self
+            .catalog
+            .schema(table)
+            .ok_or_else(|| QueryError::TableNotFound(table.clone()))?;
+        for aggregate in aggregates {
+            if aggregate.provenance_alias.is_some() || aggregate.function == AggFunc::CountDistinct
+            {
+                return Ok(None);
+            }
+            let Expr::Field(name) = &aggregate.argument else {
+                return Ok(None);
+            };
+            if aggregate.function == AggFunc::Count && name == "*" {
+                continue;
+            }
+            let Some(column) = schema.columns.iter().find(|column| &column.name == name) else {
+                return Ok(None);
+            };
+            if !matches!(
+                column.type_id,
+                TypeId::Int | TypeId::Float | TypeId::Bool | TypeId::DateTime
+            ) {
+                return Ok(None);
+            }
+            if matches!(aggregate.function, AggFunc::Sum | AggFunc::Avg)
+                && !matches!(column.type_id, TypeId::Int | TypeId::Float)
+            {
+                return Ok(None);
+            }
+        }
+        if self.generic_path_forced("aggregate:stream-constant-group") {
+            return Ok(None);
+        }
+        // Reserve layout, accumulators, direct indices and the single output
+        // row before allocating. All eligible values are fixed-width.
+        let state_bytes = schema
+            .columns
+            .len()
+            .saturating_mul(64)
+            .saturating_add(
+                aggregates
+                    .len()
+                    .saturating_mul(std::mem::size_of::<StreamingAccumulator>() + 128),
+            )
+            .saturating_add(
+                aggregates
+                    .iter()
+                    .map(|a| a.output_name.len().saturating_mul(2))
+                    .sum::<usize>(),
+            )
+            .saturating_add(512);
+        mem_budget::charge(state_bytes, self.query_memory_limit())?;
+        let layout = powdb_storage::row::RowLayout::new(schema);
+        let indices: Vec<Option<usize>> = aggregates
+            .iter()
+            .map(|aggregate| {
+                let Expr::Field(name) = &aggregate.argument else {
+                    unreachable!()
+                };
+                schema
+                    .columns
+                    .iter()
+                    .position(|column| &column.name == name)
+            })
+            .collect();
+        let mut states: Vec<StreamingAccumulator> = aggregates
+            .iter()
+            .map(|_| StreamingAccumulator {
+                numeric: NumericAgg::new(),
+                count: 0,
+                extreme: None,
+            })
+            .collect();
+        let mut seen = false;
+        let mut error = None;
+        let mut cancel = CancelCheck::new();
+        self.catalog
+            .try_for_each_row_raw(table, |_rid, data| {
+                #[cfg(feature = "testing")]
+                crate::executor::work_stats::record_seq_row();
+                if let Err(err) = cancel.tick() {
+                    error = Some(err);
+                    return ControlFlow::Break(());
+                }
+                seen = true;
+                for ((aggregate, index), state) in aggregates.iter().zip(&indices).zip(&mut states)
+                {
+                    let value = index.map(|index| {
+                        powdb_storage::row::decode_column(schema, &layout, data, index)
+                    });
+                    if value.as_ref().is_some_and(Value::is_empty) {
+                        continue;
+                    }
+                    match aggregate.function {
+                        AggFunc::Count => state.count += 1,
+                        AggFunc::Sum | AggFunc::Avg => {
+                            let label = if aggregate.function == AggFunc::Sum {
+                                "sum"
+                            } else {
+                                "avg"
+                            };
+                            if let Err(err) = state
+                                .numeric
+                                .push(label, value.as_ref().expect("numeric argument"))
+                            {
+                                error = Some(err);
+                                return ControlFlow::Break(());
+                            }
+                        }
+                        AggFunc::Min | AggFunc::Max => {
+                            let value = value.expect("extreme argument");
+                            let replace = state.extreme.as_ref().is_none_or(|current| {
+                                if aggregate.function == AggFunc::Min {
+                                    value < *current
+                                } else {
+                                    value > *current
+                                }
+                            });
+                            if replace {
+                                state.extreme = Some(value);
+                            }
+                        }
+                        AggFunc::CountDistinct => unreachable!(),
+                    }
+                }
+                ControlFlow::Continue(())
+            })
+            .map_err(QueryError::from_storage_io)?;
+        if let Some(error) = error {
+            return Err(error);
+        }
+        let mut columns = vec![keys[0].output_name()];
+        columns.extend(
+            aggregates
+                .iter()
+                .map(|aggregate| aggregate.output_name.clone()),
+        );
+        let mut rows = Vec::new();
+        if seen {
+            let mut row = vec![eval_expr(&keys[0].expr, &[], &[])];
+            for (aggregate, state) in aggregates.iter().zip(states) {
+                row.push(match aggregate.function {
+                    AggFunc::Count => Value::Int(state.count),
+                    AggFunc::Sum => state.numeric.sum("sum")?,
+                    AggFunc::Avg => state.numeric.avg(),
+                    AggFunc::Min | AggFunc::Max => state.extreme.unwrap_or(Value::Empty),
+                    AggFunc::CountDistinct => unreachable!(),
+                });
+            }
+            if having
+                .as_ref()
+                .is_none_or(|having| eval_predicate(having, &row, &columns))
+            {
+                rows.push(row);
+            }
+        }
+        Ok(Some(QueryResult::Rows { columns, rows }))
+    }
+}
+
 pub(crate) fn execute_window(
     result: QueryResult,
     windows: &[WindowDef],
@@ -958,6 +1149,62 @@ fn accept_symmetric_contribution(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_constant_group_honors_live_cancellation() {
+        use crate::cancel::{CancelReason, ExecCancel};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = crate::executor::Engine::new(dir.path()).unwrap();
+        engine.execute_powql("type T { v: int }").unwrap();
+        for i in 0..10_000 {
+            engine
+                .catalog_mut()
+                .get_table_mut("T")
+                .unwrap()
+                .insert(&vec![Value::Int(i)])
+                .unwrap();
+        }
+        let token = Arc::new(ExecCancel::new());
+        token.block_at_checkpoint(2);
+        let observer = Arc::clone(&token);
+        let sender = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while observer.checkpoint_count() < 2 && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let reached = observer.checkpoint_count() >= 2;
+            observer.cancel(CancelReason::Disconnect);
+            reached
+        });
+        let guard = crate::cancel::install(token);
+        // Calling the helper directly means every cancellation checkpoint is
+        // inside its row visitor, not an earlier statement-entry check.
+        let result = engine.try_stream_constant_group(
+            &PlanNode::SeqScan { table: "T".into() },
+            &[GroupKey {
+                expr: Expr::Literal(Literal::Int(1)),
+                output_name: "key".into(),
+            }],
+            &[GroupAgg {
+                function: AggFunc::Sum,
+                argument: value_field(),
+                mode: AggregateMode::Raw,
+                provenance_alias: None,
+                output_name: "total".into(),
+            }],
+            &None,
+        );
+        drop(guard);
+        assert!(
+            sender.join().unwrap(),
+            "stream never reached its second cancellation checkpoint"
+        );
+        assert!(result.is_err());
+        assert!(engine.execute_powql("count(T)").is_ok());
+    }
 
     const HUGE: i64 = 4_000_000_000_000_000_000;
 

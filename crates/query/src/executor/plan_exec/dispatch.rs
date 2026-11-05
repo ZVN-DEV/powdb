@@ -96,6 +96,8 @@ impl Engine {
                     .map_err(QueryError::from_storage_io)?
                 {
                     let (_, row) = item.map_err(QueryError::from_storage_io)?;
+                    #[cfg(feature = "testing")]
+                    crate::executor::work_stats::record_seq_row();
                     cancel.tick()?;
                     rows.push(row);
                 }
@@ -267,42 +269,14 @@ impl Engine {
                         return Ok(result);
                     }
                 }
-                // Fast path: Project over IndexScan — decode only projected
-                // columns from raw bytes instead of full decode_row.
+                // Fast path: Project over IndexScan — project matching rows
+                // without constructing generic expression-evaluation state.
                 if let PlanNode::IndexScan { table, column, key } = input.as_ref() {
-                    let schema = self
-                        .catalog
-                        .schema(table)
-                        .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?
-                        .clone();
-                    let all_columns: Vec<String> =
-                        schema.columns.iter().map(|c| c.name.clone()).collect();
                     let key_value = literal_to_value(key)?;
                     let tbl = self
                         .catalog
                         .get_table(table)
                         .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
-
-                    let proj_columns: Vec<String> = fields
-                        .iter()
-                        .map(|f| {
-                            f.alias
-                                .clone()
-                                .unwrap_or_else(|| projection_output_name(&f.expr))
-                        })
-                        .collect();
-
-                    // Determine which column indices the projection needs
-                    let proj_indices: Vec<usize> = fields
-                        .iter()
-                        .filter_map(|f| {
-                            if let Expr::Field(name) = &f.expr {
-                                all_columns.iter().position(|c| c == name)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
 
                     // Only serve plain-field projections here; a computed
                     // projection (e.g. `length(.v)`) must fall through to the
@@ -313,6 +287,21 @@ impl Engine {
                         && all_plain_fields
                         && !self.generic_path_forced("project-over-index-scan")
                     {
+                        let proj_columns: Vec<String> = fields
+                            .iter()
+                            .map(|f| {
+                                f.alias
+                                    .clone()
+                                    .unwrap_or_else(|| projection_output_name(&f.expr))
+                            })
+                            .collect();
+                        let proj_indices: Vec<usize> = fields
+                            .iter()
+                            .filter_map(|f| match &f.expr {
+                                Expr::Field(name) => tbl.schema().column_index(name),
+                                _ => None,
+                            })
+                            .collect();
                         let rids = tbl.index_lookup_all(column, &key_value);
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
                         let mut cancel = CancelCheck::new();
@@ -1791,6 +1780,11 @@ impl Engine {
                 aggregates,
                 having,
             } => {
+                if let Some(result) =
+                    self.try_stream_constant_group(input, keys, aggregates, having)?
+                {
+                    return Ok(result);
+                }
                 if aggregates
                     .iter()
                     .any(|aggregate| aggregate.provenance_alias.is_some())
@@ -2336,11 +2330,15 @@ impl Engine {
                 // Uses index_lookup_all to return ALL matching rows for
                 // both unique and non-unique indexes.
                 if tbl.has_index(column) {
+                    #[cfg(feature = "testing")]
+                    crate::executor::work_stats::record_index_probe();
                     let rids = tbl.index_lookup_all(column, &key_value);
                     let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
                     let mut cancel = CancelCheck::new();
                     for rid in rids {
                         cancel.tick()?;
+                        #[cfg(feature = "testing")]
+                        crate::executor::work_stats::record_heap_fetch();
                         // Overflow safety (P0-3/P0-4): `tbl.get` reassembles
                         // spilled columns; the old `heap.get` + `decode_row`
                         // returned Empty / wrapped a >= 64KB value.

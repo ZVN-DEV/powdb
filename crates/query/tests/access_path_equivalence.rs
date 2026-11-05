@@ -1543,6 +1543,10 @@ const SITES_REACHED_BY_THE_CORPUS: &[&str] = &[
 /// guard has to be added to one of these two lists, so it cannot be introduced
 /// without someone deciding whether the runner covers it.
 const UNCOVERED_SITES: &[(&str, &str)] = &[
+    (
+        "aggregate:stream-constant-group",
+        "covered by streaming_aggregate_recovery's forced generic comparison",
+    ),
     // The read-only mirror's own nested and lowering-shadowed guards, excused
     // for the same reasons as their read-write twins below. The mirror's
     // reachable sites are in SITES_REACHED_BY_THE_CORPUS.
