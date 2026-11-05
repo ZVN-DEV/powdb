@@ -274,6 +274,14 @@ enum JsonSeg {
     Index(u32),
 }
 
+// Keep membership's binary-search expansion out of the inline leaf evaluator
+// used by established numeric/conjunction loops. Measure both paths after any
+// change to this boundary; an annotation alone does not prove a speedup.
+#[inline(never)]
+fn integer_membership_contains(keys: &[i64], value: i64) -> bool {
+    keys.binary_search(&value).is_ok()
+}
+
 impl CompiledLeaf {
     /// Evaluate this leaf against a row's raw bytes. `#[inline]` so the
     /// match folds into the caller's tight loop with LTO.
@@ -293,7 +301,7 @@ impl CompiledLeaf {
                 keys,
                 negated,
             } => compiled_int_value(encoded, *data_offset, *bitmap_byte, *bitmap_bit)
-                .is_some_and(|value| keys.binary_search(&value).is_ok() != *negated),
+                .is_some_and(|value| integer_membership_contains(keys, value) != *negated),
             CompiledLeaf::Int {
                 data_offset,
                 bitmap_byte,
