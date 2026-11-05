@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.29.1 - 2026-11-04
+
+No sync API or replication-format changes. The version and exact peer pins track
+the engine performance patch, wire client, and embedded addon. Sync semantics
+and the existing transaction-error handling requirements are unchanged.
+
 ## 0.29.0 - 2026-10-08
 
 There are no sync package API changes in 0.29.0. The package version and peer

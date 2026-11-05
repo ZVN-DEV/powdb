@@ -5,15 +5,25 @@ Changes to `@zvndev/powdb-embedded`, the embedded PowDB native addon for Node.
 Releases before this file existed are recorded in the [repository
 CHANGELOG](https://github.com/ZVN-DEV/powdb/blob/main/CHANGELOG.md), which
 covers every PowDB crate and package in one place. The package version tracks
-the engine, so `@zvndev/powdb-embedded` 0.29.0 is PowDB 0.29.0.
+the engine, so `@zvndev/powdb-embedded` 0.29.1 is PowDB 0.29.1.
 
 ## Unreleased
 
-## 0.29.0 - Unreleased
+## 0.29.1 - 2026-11-04
+
+### Performance
+
+- Eligible indexed membership reads avoid full-table scans, and eligible
+  fixed-width multiaggregate reports use streaming state instead of retaining
+  input rows. Point queries and integer filters also do less repeated work.
+  The JavaScript API, stored formats, memory allowance and default durability
+  are unchanged; unsupported query shapes retain their existing paths.
+
+## 0.29.0 - 2026-10-08
 
 ### Changed
 
-- The embedded addon version moves in lockstep with the 0.29.0 engine candidate.
+- The embedded addon version moves in lockstep with the 0.29.0 engine.
   The JavaScript API shape is unchanged, but engine errors now include the new
   transaction-safety cases: after a failed statement in an explicit transaction,
   callers must `ROLLBACK` before doing more work, and an uncertain commit outcome
