@@ -38,6 +38,10 @@ and [recovery methodology](docs/benchmarks/query-recovery.md).
 
 ### Security and compatibility
 
+- Reject impossible index node, key and child counts before reserving memory.
+  This prevents tiny malformed index files with valid checksums from driving
+  multi-gigabyte allocations during open. Recovered fuzz cases are retained in
+  the deterministic replay corpus; valid index formats remain unchanged.
 - Refresh compatible TLS, certificate-root, constant-time utility, and optional
   comparison-tool compression dependencies to patched versions.
 - Public Rust and JavaScript APIs, wire and disk formats, transaction failure
