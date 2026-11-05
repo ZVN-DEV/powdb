@@ -75,6 +75,11 @@ name = "query-recovery-gate"
 path = "src/bin/query_recovery_gate.rs"
 test = false
 
+[[bin]]
+name = "unindexed-membership-gate"
+path = "src/bin/unindexed_membership_gate.rs"
+test = false
+
 [[bench]]
 name = "powql"
 harness = false

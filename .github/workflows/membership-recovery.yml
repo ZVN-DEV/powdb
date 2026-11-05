@@ -1,0 +1,92 @@
+name: unindexed membership recovery
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/membership-recovery.yml
+      - crates/bench/src/bin/unindexed_membership_gate.rs
+      - crates/query/src/executor/compiled.rs
+      - crates/query/tests/compiled_membership*.rs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  membership:
+    name: paired unindexed membership gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: -C target-cpu=x86-64-v2
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: candidate
+          persist-credentials: false
+      - name: Checkout frozen control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Reviewed v0.29.1 release-candidate engine, before this optimization.
+          # Keep this control fixed; it is not a moving main baseline.
+          ref: 8508546560f7a280792d6ba37058f71f98e85e53
+          path: control
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            candidate -> target
+            control -> target
+          shared-key: membership-recovery
+      - name: Install identical evaluator in both trees
+        run: |
+          set -euo pipefail
+          test "$(git -C candidate rev-parse HEAD)" != "$(git -C control rev-parse HEAD)"
+          for tree in candidate control; do
+            mkdir -p "$tree/crates/bench/examples"
+            cp candidate/crates/bench/src/bin/unindexed_membership_gate.rs \
+              "$tree/crates/bench/examples/unindexed_membership_gate.rs"
+          done
+          cmp candidate/crates/bench/examples/unindexed_membership_gate.rs \
+            control/crates/bench/examples/unindexed_membership_gate.rs
+      - name: Build both before timing
+        run: |
+          set -euo pipefail
+          (cd control && cargo build --release --locked -p powdb-bench --example unindexed_membership_gate)
+          (cd candidate && cargo build --release --locked -p powdb-bench --example unindexed_membership_gate)
+      - name: Record machine and binary provenance
+        run: |
+          set -euo pipefail
+          {
+            rustc -vV
+            git -C candidate rev-parse HEAD
+            git -C control rev-parse HEAD
+            printenv RUSTFLAGS
+            lscpu
+            free -b
+            df -h "$GITHUB_WORKSPACE"
+            sha256sum candidate/crates/bench/src/bin/unindexed_membership_gate.rs \
+              control/target/release/examples/unindexed_membership_gate \
+              candidate/target/release/examples/unindexed_membership_gate
+          } > provenance.txt
+      - name: Run five alternating pairs at 100K and 1M rows
+        run: |
+          set -euo pipefail
+          candidate/target/release/examples/unindexed_membership_gate \
+            --baseline-bin "$GITHUB_WORKSPACE/control/target/release/examples/unindexed_membership_gate" \
+            --rows 1000000 --repetitions 5 > membership-recovery.json
+      - name: Retain successes and failures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: membership-recovery
+          path: |
+            membership-recovery.json
+            provenance.txt
+          if-no-files-found: error
+          retention-days: 30

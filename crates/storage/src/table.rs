@@ -2261,7 +2261,14 @@ impl Table {
                     .unwrap_or_else(|_| vec![Value::Empty; self.schema.columns.len()]);
                 Ok((rid, row))
             } else {
-                Ok((rid, decode_row(&self.schema, &data)))
+                Ok((
+                    rid,
+                    crate::row::decode_inline_row_with_layout(
+                        &self.schema,
+                        &self.row_layout,
+                        &data,
+                    ),
+                ))
             }
         })
     }
