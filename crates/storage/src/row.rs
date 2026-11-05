@@ -1002,6 +1002,23 @@ pub fn decode_row(schema: &Schema, data: &[u8]) -> Row {
     values
 }
 
+/// Decode an inline v0/v1 row with the table's immutable cached layout.
+/// Unlike selective decoding, full-row decoding requires the entire metadata
+/// span even when every field is null (including the terminal offset when
+/// there are no variable columns). Preserve `decode_row`'s bounds behavior.
+pub(crate) fn decode_inline_row_with_layout(
+    schema: &Schema,
+    layout: &RowLayout,
+    data: &[u8],
+) -> Row {
+    let body = row_body(data);
+    let metadata_end = 2 + layout.bitmap_size + layout.fixed_region_size + (layout.n_var + 1) * 2;
+    let _metadata = &body[..metadata_end];
+    (0..schema.columns.len())
+        .map(|column| decode_column(schema, layout, data, column))
+        .collect()
+}
+
 /// Encode a row in format v2: v1 layout plus an overflow bitmap, with the
 /// spilled var columns holding their 24-byte [`OverflowStub`] in place of the
 /// inline value.
@@ -1402,6 +1419,99 @@ pub fn plan_spill(
         chosen.push(col_idx);
     }
     chosen
+}
+
+#[cfg(test)]
+mod cached_decode_tests {
+    use super::*;
+    use std::panic::catch_unwind;
+
+    fn schema(types: &[TypeId]) -> Schema {
+        Schema {
+            table_name: "T".into(),
+            columns: types
+                .iter()
+                .enumerate()
+                .map(|(i, &type_id)| ColumnDef {
+                    name: format!("c{i}"),
+                    type_id,
+                    position: i as u16,
+                    required: false,
+                })
+                .collect(),
+        }
+    }
+
+    fn parity(schema: &Schema, layout: &RowLayout, bytes: &[u8]) {
+        let old = catch_unwind(|| decode_row(schema, bytes));
+        let cached = catch_unwind(|| decode_inline_row_with_layout(schema, layout, bytes));
+        assert_eq!(old.is_ok(), cached.is_ok(), "panic parity: {bytes:?}");
+        if let (Ok(old), Ok(cached)) = (old, cached) {
+            assert_eq!(old, cached, "value parity: {bytes:?}");
+        }
+    }
+
+    #[test]
+    fn cached_inline_decode_preserves_values_and_malformed_outcomes() {
+        let original = vec![
+            Value::Str("ab".into()),
+            Value::Int(i64::MIN),
+            Value::Bytes(vec![0, 255]),
+            Value::Float(-2.5),
+            Value::Bool(true),
+            Value::Json(vec![0].into()),
+            Value::DateTime(i64::MAX),
+            Value::Uuid([17; 16]),
+            Value::Int(42),
+        ];
+        let schema = schema(&original.iter().map(Value::type_id).collect::<Vec<_>>());
+        let layout = RowLayout::new(&schema);
+        for mask in [0, 0x155, 0x0aa, 0x1ff] {
+            let values: Vec<_> = original
+                .iter()
+                .enumerate()
+                .map(|(i, value)| {
+                    if mask & (1 << i) != 0 {
+                        Value::Empty
+                    } else {
+                        value.clone()
+                    }
+                })
+                .collect();
+            let encoded = encode_row(&schema, &values);
+            for bytes in [&encoded[..], &encoded[ROW_PREFIX_SIZE..]] {
+                parity(&schema, &layout, bytes);
+                // Every missing metadata/payload boundary, including all-null
+                // variable fields whose offsets selective decoding skips.
+                for end in 0..bytes.len() {
+                    parity(&schema, &layout, &bytes[..end]);
+                }
+                // Invalid UTF-8, offset corruption and altered bitmap bytes
+                // must retain the old decoder's success-versus-panic outcome.
+                for index in 0..bytes.len() {
+                    for byte in [0, 255] {
+                        let mut malformed = bytes.to_vec();
+                        malformed[index] = byte;
+                        parity(&schema, &layout, &malformed);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_inline_decode_requires_terminal_offset_without_variable_columns() {
+        for types in [vec![], vec![TypeId::Int, TypeId::Bool]] {
+            let schema = schema(&types);
+            let layout = RowLayout::new(&schema);
+            let encoded = encode_row(&schema, &vec![Value::Empty; types.len()]);
+            for bytes in [&encoded[..], &encoded[ROW_PREFIX_SIZE..]] {
+                for end in 0..=bytes.len() {
+                    parity(&schema, &layout, &bytes[..end]);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
