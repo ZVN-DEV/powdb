@@ -327,8 +327,6 @@ The steps, in order (stop the bleeding at the installs first, then annotate):
     guard and the cross-version compat CI leg both depend on released tags
     being immutable history.
 
-[ ] Fly example (if it was deployed): redeploy the previous good version.
-
 [ ] Annotate: add the version to the yanked-versions note at the top of this
     file (the v0.4.x block is the template), and give CHANGELOG.md's entry
     for the bad version a **YANKED** header line stating why.
