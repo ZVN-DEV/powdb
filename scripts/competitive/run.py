@@ -318,7 +318,9 @@ def run(args):
                                               delivery=delivery, status="error" if "error" in response else "collected")), flush=True)
             except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:
                 failed = True
-                result["failures"].append(dict(engine=engine, round=round_number, error=str(error)))
+                failure = dict(engine=engine, round=round_number, error=str(error))
+                result["failures"].append(failure)
+                print(json.dumps(dict(worker_failure=failure)), flush=True)
             finally:
                 if worker:
                     worker.close(kill=failed)

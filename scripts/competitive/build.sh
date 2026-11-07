@@ -43,10 +43,13 @@ for backend in powdb sqlite duckdb postgres mysql wire; do
   feature="competitive-$backend"
   cargo tree --locked -p powdb-compare --features "$feature" -e normal,build \
     --prefix none --format '{p} features={f}' > "$work/$backend-features.txt"
-  if rg 'powdb-(query|storage).*features=.*\btesting\b' "$work/$backend-features.txt"; then
-    echo 'test instrumentation is forbidden in measured workers' >&2
-    exit 1
-  fi
+  python3 - "$work/$backend-features.txt" <<'PYGUARD'
+import re,sys
+from pathlib import Path
+text=Path(sys.argv[1]).read_text()
+if re.search(r'powdb-(query|storage).*features=.*\btesting\b',text):
+    raise SystemExit('test instrumentation is forbidden in measured workers')
+PYGUARD
   cargo build --release --locked -p powdb-compare --bin powdb-competitive-worker --features "$feature"
   name="$backend"
   [[ "$backend" == wire ]] && name=powdb-server
