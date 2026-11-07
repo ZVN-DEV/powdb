@@ -1,0 +1,5997 @@
+{
+  "schema": 1,
+  "profile": "relational-reads-v1",
+  "qualification_reasons": [],
+  "cells": [
+    {
+      "engine": "mysql",
+      "case": "point_bound",
+      "category": "point_bound",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 22029.75,
+      "round_medians_ns": [
+        22017.5,
+        21897.5,
+        22002.5,
+        22224.0,
+        22125.0,
+        22042.0
+      ],
+      "relative_round_spread": 0.014820867236350843,
+      "per_request_samples": 6000,
+      "p95_ns": 28401,
+      "p99_ns": 38622,
+      "median_first_row_ns": 22029.75,
+      "sampled_peak_pss_kib": 514419.0,
+      "producer": "materialized-prepared-point"
+    },
+    {
+      "engine": "mysql",
+      "case": "point_indexed",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 29175.75,
+      "round_medians_ns": [
+        28993.0,
+        29135.0,
+        29491.5,
+        29352.0,
+        29053.5,
+        29216.5
+      ],
+      "relative_round_spread": 0.017086107469388104,
+      "per_request_samples": 6000,
+      "p95_ns": 39353,
+      "p99_ns": 55441,
+      "median_first_row_ns": 29175.75,
+      "sampled_peak_pss_kib": 514629.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "point_missing",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 24029.25,
+      "round_medians_ns": [
+        23968.5,
+        23628.5,
+        23761.0,
+        24100.5,
+        24231.5,
+        24090.0
+      ],
+      "relative_round_spread": 0.025094416180280285,
+      "per_request_samples": 6000,
+      "p95_ns": 31147,
+      "p99_ns": 40889,
+      "median_first_row_ns": null,
+      "sampled_peak_pss_kib": 511425.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "point_unindexed",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 35896450.5,
+      "round_medians_ns": [
+        36000296.0,
+        35884018.5,
+        36003110.5,
+        35908882.5,
+        35808119.0,
+        35864213.0
+      ],
+      "relative_round_spread": 0.005432055183283372,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 35896450.5,
+      "sampled_peak_pss_kib": 509463.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "range_page",
+      "category": "range",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 447690.75,
+      "round_medians_ns": [
+        446943.5,
+        457749.5,
+        443238.0,
+        446559.0,
+        450628.0,
+        448438.0
+      ],
+      "relative_round_spread": 0.03241411621750059,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 447690.75,
+      "sampled_peak_pss_kib": 507407.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "filtered_count",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 11465802.0,
+      "round_medians_ns": [
+        11418905.0,
+        11518436.0,
+        11433790.0,
+        11573538.5,
+        11497814.0,
+        11391578.5
+      ],
+      "relative_round_spread": 0.01586980134490374,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 11465802.0,
+      "sampled_peak_pss_kib": 506723.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "and_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 2035181.0,
+      "round_medians_ns": [
+        2038916.0,
+        2060045.5,
+        2029836.0,
+        2042169.0,
+        2024338.0,
+        2031446.0
+      ],
+      "relative_round_spread": 0.017545122522271975,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2035181.0,
+      "sampled_peak_pss_kib": 506821.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "or_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 1557043.75,
+      "round_medians_ns": [
+        1559873.5,
+        1579753.5,
+        1554214.0,
+        1576176.0,
+        1544805.5,
+        1547929.5
+      ],
+      "relative_round_spread": 0.022445098283204953,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1557043.75,
+      "sampled_peak_pss_kib": 506919.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "indexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 182596.5,
+      "round_medians_ns": [
+        181076.5,
+        175640.0,
+        182560.5,
+        207804.0,
+        182632.5,
+        191402.5
+      ],
+      "relative_round_spread": 0.1761479546431613,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 182596.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "unindexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 13336437.0,
+      "round_medians_ns": [
+        13488256.5,
+        13506901.0,
+        13258569.0,
+        13214863.5,
+        13296558.5,
+        13376315.5
+      ],
+      "relative_round_spread": 0.02189771525933051,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 13336437.0,
+      "sampled_peak_pss_kib": 507361.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "unindexed_not_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 12615842.25,
+      "round_medians_ns": [
+        12592840.0,
+        12591070.0,
+        12493380.5,
+        12713312.5,
+        12638844.5,
+        12762449.0
+      ],
+      "relative_round_spread": 0.021327826923327294,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 12615842.25,
+      "sampled_peak_pss_kib": 507363.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "null_count",
+      "category": "nulls",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 10726257.5,
+      "round_medians_ns": [
+        10731925.0,
+        10845061.0,
+        10686442.0,
+        10841379.0,
+        10720590.0,
+        10709591.0
+      ],
+      "relative_round_spread": 0.014787916475061315,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 10726257.5,
+      "sampled_peak_pss_kib": 507367.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "sort_top100",
+      "category": "sorting",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 16826043.25,
+      "round_medians_ns": [
+        16701585.0,
+        16898261.5,
+        16753825.0,
+        17096394.5,
+        16702081.0,
+        16995944.0
+      ],
+      "relative_round_spread": 0.02346419144025438,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 16826043.25,
+      "sampled_peak_pss_kib": 507447.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "pagination_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 27748047.75,
+      "round_medians_ns": [
+        27907219.0,
+        27474908.0,
+        27569653.5,
+        28407203.0,
+        27597035.5,
+        27899060.0
+      ],
+      "relative_round_spread": 0.03359857992171719,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 27748047.75,
+      "sampled_peak_pss_kib": 507765.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "pagination_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 16220381.5,
+      "round_medians_ns": [
+        16185757.5,
+        16255005.5,
+        16178759.0,
+        16386758.0,
+        16036720.5,
+        16259065.5
+      ],
+      "relative_round_spread": 0.02158010278611511,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 16220381.5,
+      "sampled_peak_pss_kib": 507803.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "pagination_pk_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 9981777.5,
+      "round_medians_ns": [
+        9999477.0,
+        9982542.0,
+        10600462.5,
+        9964558.0,
+        9978692.5,
+        9981013.0
+      ],
+      "relative_round_spread": 0.06370653924113215,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 9981777.5,
+      "sampled_peak_pss_kib": 507835.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "pagination_pk_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 422005.5,
+      "round_medians_ns": [
+        461701.5,
+        387658.0,
+        463559.5,
+        382073.0,
+        456353.0,
+        384011.5
+      ],
+      "relative_round_spread": 0.19309345494312277,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 422005.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "sum",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 13788563.75,
+      "round_medians_ns": [
+        13813974.0,
+        13763153.5,
+        13645593.0,
+        13710798.5,
+        13832748.0,
+        13949049.0
+      ],
+      "relative_round_spread": 0.022007803387064154,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 13788563.75,
+      "sampled_peak_pss_kib": 507925.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "avg",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 13904530.5,
+      "round_medians_ns": [
+        13916837.5,
+        13892223.5,
+        13697573.0,
+        13798780.0,
+        13947600.5,
+        14013307.0
+      ],
+      "relative_round_spread": 0.022707275157546673,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 13904530.5,
+      "sampled_peak_pss_kib": 508119.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 34573075.0,
+      "round_medians_ns": [
+        34568313.0,
+        34591418.0,
+        34480064.5,
+        34808528.5,
+        34473709.5,
+        34577837.0
+      ],
+      "relative_round_spread": 0.009684385898564128,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 34573075.0,
+      "sampled_peak_pss_kib": 508281.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "distinct",
+      "category": "set",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 20876408.5,
+      "round_medians_ns": [
+        20898058.0,
+        20670206.5,
+        20854759.0,
+        20926426.5,
+        20654178.0,
+        21087576.0
+      ],
+      "relative_round_spread": 0.020760180085573628,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 20876408.5,
+      "sampled_peak_pss_kib": 508369.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "join_projection",
+      "category": "join",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 2170922.0,
+      "round_medians_ns": [
+        2164924.5,
+        2187299.5,
+        2168156.5,
+        2186782.0,
+        2157317.5,
+        2173687.5
+      ],
+      "relative_round_spread": 0.013810721896042327,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2170922.0,
+      "sampled_peak_pss_kib": 508421.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "compound_join",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 318803.75,
+      "round_medians_ns": [
+        320077.0,
+        335622.0,
+        330118.5,
+        274235.5,
+        317530.5,
+        281450.5
+      ],
+      "relative_round_spread": 0.19255262838031234,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 318803.75,
+      "sampled_peak_pss_kib": null,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "join_group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 101921470.25,
+      "round_medians_ns": [
+        101911194.5,
+        101931746.0,
+        101368763.0,
+        101966325.0,
+        101705435.5,
+        102447858.0
+      ],
+      "relative_round_spread": 0.010587514066988256,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 101921470.25,
+      "sampled_peak_pss_kib": 508557.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "exists_correlated",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 491839.25,
+      "round_medians_ns": [
+        493779.5,
+        489899.0,
+        555203.5,
+        536164.5,
+        484806.5,
+        487984.0
+      ],
+      "relative_round_spread": 0.14313009789275663,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 491839.25,
+      "sampled_peak_pss_kib": null,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "in_subquery",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 488083.25,
+      "round_medians_ns": [
+        489469.0,
+        482883.0,
+        483173.0,
+        499780.5,
+        492955.0,
+        486697.5
+      ],
+      "relative_round_spread": 0.03462011859657138,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 488083.25,
+      "sampled_peak_pss_kib": null,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "case_expression",
+      "category": "expression",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 86075.25,
+      "round_medians_ns": [
+        86359.5,
+        85791.0,
+        84879.0,
+        85379.0,
+        108591.0,
+        87458.0
+      ],
+      "relative_round_spread": 0.27547988533289186,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 86075.25,
+      "sampled_peak_pss_kib": null,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "int64_exact",
+      "category": "types",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 25748.25,
+      "round_medians_ns": [
+        25201.5,
+        25990.0,
+        32469.5,
+        25506.5,
+        32317.0,
+        25491.0
+      ],
+      "relative_round_spread": 0.28227161069198875,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 25748.25,
+      "sampled_peak_pss_kib": null,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "window_rank",
+      "category": "window",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 153985.75,
+      "round_medians_ns": [
+        146558.0,
+        148970.0,
+        184603.0,
+        154485.0,
+        168490.5,
+        153486.5
+      ],
+      "relative_round_spread": 0.24706831638641888,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 153985.75,
+      "sampled_peak_pss_kib": null,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 33891427.0,
+      "round_medians_ns": [
+        34404412,
+        34455017,
+        33358434,
+        34042254,
+        33740600,
+        33556406
+      ],
+      "relative_round_spread": 0.032355763597679145,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 33891427.0,
+      "sampled_peak_pss_kib": 521733.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 40570251.5,
+      "round_medians_ns": [
+        39752849,
+        40988003,
+        40952562,
+        39783692,
+        40654437,
+        40486066
+      ],
+      "relative_round_spread": 0.0304448198946955,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2539862.5,
+      "sampled_peak_pss_kib": 511867.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 70245651.5,
+      "round_medians_ns": [
+        70340815,
+        69796621,
+        70449772,
+        70617643,
+        69268354,
+        70150488
+      ],
+      "relative_round_spread": 0.0192081498454036,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 70245651.5,
+      "sampled_peak_pss_kib": 542712.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "mysql",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 96298876.5,
+      "round_medians_ns": [
+        99318073,
+        95973520,
+        96831136,
+        96269510,
+        95834371,
+        96328243
+      ],
+      "relative_round_spread": 0.036175936071279086,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 818268.0,
+      "sampled_peak_pss_kib": 511831.0,
+      "producer": "mysql-query-iterator"
+    },
+    {
+      "engine": "postgres",
+      "case": "point_bound",
+      "category": "point_bound",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 19574.75,
+      "round_medians_ns": [
+        19527.0,
+        20695.5,
+        19435.0,
+        19859.0,
+        19622.5,
+        19437.5
+      ],
+      "relative_round_spread": 0.0643941812794544,
+      "per_request_samples": 6000,
+      "p95_ns": 26621,
+      "p99_ns": 44537,
+      "median_first_row_ns": 19574.75,
+      "sampled_peak_pss_kib": 72000.0,
+      "producer": "materialized-prepared-point"
+    },
+    {
+      "engine": "postgres",
+      "case": "point_indexed",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 68532.5,
+      "round_medians_ns": [
+        68565.5,
+        69587.0,
+        68499.5,
+        68315.0,
+        68823.0,
+        68371.5
+      ],
+      "relative_round_spread": 0.018560536971509868,
+      "per_request_samples": 6000,
+      "p95_ns": 82516,
+      "p99_ns": 97218,
+      "median_first_row_ns": 68532.5,
+      "sampled_peak_pss_kib": 71795.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "point_missing",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 61855.5,
+      "round_medians_ns": [
+        61533.0,
+        60772.0,
+        61948.5,
+        62188.5,
+        61762.5,
+        62442.0
+      ],
+      "relative_round_spread": 0.026998407578954175,
+      "per_request_samples": 6000,
+      "p95_ns": 74916,
+      "p99_ns": 90341,
+      "median_first_row_ns": null,
+      "sampled_peak_pss_kib": 71166.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "point_unindexed",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 9083796.5,
+      "round_medians_ns": [
+        8931683.5,
+        9411663.0,
+        9568565.0,
+        9232527.0,
+        8935066.0,
+        8807313.5
+      ],
+      "relative_round_spread": 0.083803231391192,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 9083796.5,
+      "sampled_peak_pss_kib": 70188.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "range_page",
+      "category": "range",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 90569.75,
+      "round_medians_ns": [
+        87104.0,
+        87273.0,
+        87716.0,
+        93423.5,
+        94969.5,
+        108672.5
+      ],
+      "relative_round_spread": 0.23814242614117848,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 90569.75,
+      "sampled_peak_pss_kib": null,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "filtered_count",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 7819921.5,
+      "round_medians_ns": [
+        7434719.5,
+        7743373.0,
+        8252724.0,
+        7713923.5,
+        7896470.0,
+        7961118.5
+      ],
+      "relative_round_spread": 0.10460520607527837,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 7819921.5,
+      "sampled_peak_pss_kib": 69256.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "and_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 735877.5,
+      "round_medians_ns": [
+        735117.0,
+        736668.0,
+        736025.0,
+        720350.5,
+        735730.0,
+        741511.0
+      ],
+      "relative_round_spread": 0.028755465413740737,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 735877.5,
+      "sampled_peak_pss_kib": 69297.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "or_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 599175.5,
+      "round_medians_ns": [
+        600429.0,
+        600702.5,
+        585740.0,
+        598150.5,
+        599037.0,
+        599314.0
+      ],
+      "relative_round_spread": 0.024971815436378823,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 599175.5,
+      "sampled_peak_pss_kib": 69115.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "indexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 262927.5,
+      "round_medians_ns": [
+        262913.0,
+        259724.5,
+        262942.0,
+        257946.0,
+        264207.5,
+        263181.5
+      ],
+      "relative_round_spread": 0.02381454963820825,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 262927.5,
+      "sampled_peak_pss_kib": 69235.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "unindexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 10395222.5,
+      "round_medians_ns": [
+        10099072.5,
+        10254159.0,
+        10689001.0,
+        10519673.0,
+        10270772.0,
+        10652388.0
+      ],
+      "relative_round_spread": 0.056749963745364757,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 10395222.5,
+      "sampled_peak_pss_kib": 69239.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "unindexed_not_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 11765032.0,
+      "round_medians_ns": [
+        11548784.0,
+        11788288.0,
+        11915235.5,
+        11843493.5,
+        11741776.0,
+        11684687.5
+      ],
+      "relative_round_spread": 0.0311475140909094,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 11765032.0,
+      "sampled_peak_pss_kib": 69243.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "null_count",
+      "category": "nulls",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 8570294.5,
+      "round_medians_ns": [
+        7859640.0,
+        8531304.5,
+        8738409.0,
+        8706571.0,
+        8440137.5,
+        8609284.5
+      ],
+      "relative_round_spread": 0.10253661644882799,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 8570294.5,
+      "sampled_peak_pss_kib": 69243.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "sort_top100",
+      "category": "sorting",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 12156921.75,
+      "round_medians_ns": [
+        11898099.0,
+        12130058.5,
+        12102240.0,
+        12183785.0,
+        12287227.5,
+        12386278.0
+      ],
+      "relative_round_spread": 0.040156464772836103,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 12156921.75,
+      "sampled_peak_pss_kib": 69248.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "pagination_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 40961555.75,
+      "round_medians_ns": [
+        40222271.0,
+        41390402.0,
+        41038512.0,
+        40884599.5,
+        40621300.5,
+        41122383.5
+      ],
+      "relative_round_spread": 0.02851774007631534,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 40961555.75,
+      "sampled_peak_pss_kib": 74797.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "pagination_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 10589072.5,
+      "round_medians_ns": [
+        10296616.5,
+        10473162.5,
+        10507538.0,
+        10670607.0,
+        10794525.5,
+        10973027.0
+      ],
+      "relative_round_spread": 0.06387816307802217,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 10589072.5,
+      "sampled_peak_pss_kib": 69417.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "pagination_pk_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 9562562.25,
+      "round_medians_ns": [
+        9344878.5,
+        9507269.5,
+        9448809.5,
+        9752047.0,
+        9617855.0,
+        9779177.0
+      ],
+      "relative_round_spread": 0.04541654094853082,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 9562562.25,
+      "sampled_peak_pss_kib": 69417.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "pagination_pk_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 121125.75,
+      "round_medians_ns": [
+        119727.5,
+        119254.5,
+        117675.0,
+        122524.0,
+        149339.5,
+        124174.5
+      ],
+      "relative_round_spread": 0.2614184019500395,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 121125.75,
+      "sampled_peak_pss_kib": null,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "sum",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 8596279.25,
+      "round_medians_ns": [
+        8514902.0,
+        8586886.5,
+        8605672.0,
+        8954967.0,
+        8858918.5,
+        8475580.5
+      ],
+      "relative_round_spread": 0.05576674350126539,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 8596279.25,
+      "sampled_peak_pss_kib": 69572.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "avg",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 8550890.0,
+      "round_medians_ns": [
+        8227703.0,
+        8573455.5,
+        8480777.5,
+        8822218.0,
+        8698514.0,
+        8528324.5
+      ],
+      "relative_round_spread": 0.06952668084842631,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 8550890.0,
+      "sampled_peak_pss_kib": 69610.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 15811264.75,
+      "round_medians_ns": [
+        15783100.5,
+        15826934.5,
+        15778593.0,
+        15843010.0,
+        15827021.5,
+        15795595.0
+      ],
+      "relative_round_spread": 0.004074120636048423,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 15811264.75,
+      "sampled_peak_pss_kib": 69614.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "distinct",
+      "category": "set",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 12901248.5,
+      "round_medians_ns": [
+        12898337.0,
+        12829769.5,
+        13012950.5,
+        12989277.5,
+        12904160.0,
+        12845239.5
+      ],
+      "relative_round_spread": 0.014198703327046217,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 12901248.5,
+      "sampled_peak_pss_kib": 69615.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "join_projection",
+      "category": "join",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 1422753.25,
+      "round_medians_ns": [
+        1426040.0,
+        1414855.5,
+        1424917.5,
+        1439444.0,
+        1420589.0,
+        1419536.5
+      ],
+      "relative_round_spread": 0.017282336202711187,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1422753.25,
+      "sampled_peak_pss_kib": 69675.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "compound_join",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 369699.25,
+      "round_medians_ns": [
+        328071.5,
+        335808.0,
+        405349.0,
+        394230.0,
+        401253.5,
+        345168.5
+      ],
+      "relative_round_spread": 0.20902801398704488,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 369699.25,
+      "sampled_peak_pss_kib": null,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "join_group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 22421984.25,
+      "round_medians_ns": [
+        22522288.0,
+        22401916.0,
+        22406671.5,
+        22563336.0,
+        22412264.0,
+        22431704.5
+      ],
+      "relative_round_spread": 0.007199184434357097,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 22421984.25,
+      "sampled_peak_pss_kib": 69711.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "exists_correlated",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 748295.25,
+      "round_medians_ns": [
+        749382.0,
+        745506.0,
+        756244.0,
+        747208.5,
+        750499.0,
+        746944.5
+      ],
+      "relative_round_spread": 0.014349950771436809,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 748295.25,
+      "sampled_peak_pss_kib": 69721.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "in_subquery",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 748383.0,
+      "round_medians_ns": [
+        745785.5,
+        753100.5,
+        757287.0,
+        747593.5,
+        749172.5,
+        745422.0
+      ],
+      "relative_round_spread": 0.015854181615563154,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 748383.0,
+      "sampled_peak_pss_kib": 69721.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "case_expression",
+      "category": "expression",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 170136.0,
+      "round_medians_ns": [
+        171757.5,
+        193453.5,
+        169209.5,
+        137513.5,
+        167750.5,
+        171062.5
+      ],
+      "relative_round_spread": 0.32879578689989186,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 170136.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "int64_exact",
+      "category": "types",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 77367.25,
+      "round_medians_ns": [
+        62031.0,
+        61197.5,
+        77024.5,
+        77710.0,
+        77870.0,
+        79076.5
+      ],
+      "relative_round_spread": 0.23109261347663254,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 77367.25,
+      "sampled_peak_pss_kib": null,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "window_rank",
+      "category": "window",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 191582.25,
+      "round_medians_ns": [
+        192542.5,
+        190622.0,
+        189292.0,
+        236889.0,
+        239282.5,
+        183049.0
+      ],
+      "relative_round_spread": 0.2935214509694922,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 191582.25,
+      "sampled_peak_pss_kib": null,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 56624827.0,
+      "round_medians_ns": [
+        55035085,
+        56695347,
+        56897944,
+        56716144,
+        55296387,
+        56554307
+      ],
+      "relative_round_spread": 0.032898272695826514,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 56624827.0,
+      "sampled_peak_pss_kib": 98470.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 62588306.0,
+      "round_medians_ns": [
+        61729430,
+        62991017,
+        62261207,
+        63112940,
+        61930525,
+        62915405
+      ],
+      "relative_round_spread": 0.022104928035598215,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 21128831.5,
+      "sampled_peak_pss_kib": 75728.5,
+      "producer": "postgres-portal-256"
+    },
+    {
+      "engine": "postgres",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 72381786.5,
+      "round_medians_ns": [
+        71664842,
+        74411749,
+        72248663,
+        72799461,
+        72344424,
+        72419149
+      ],
+      "relative_round_spread": 0.03795025147659211,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 72381786.5,
+      "sampled_peak_pss_kib": 108948.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 99739838.0,
+      "round_medians_ns": [
+        100101016,
+        100112667,
+        99102704,
+        100024212,
+        99455464,
+        99274971
+      ],
+      "relative_round_spread": 0.01012597393631219,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 338089.5,
+      "sampled_peak_pss_kib": 69489.5,
+      "producer": "postgres-portal-256"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "point_bound",
+      "category": "point_bound",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 19742.5,
+      "round_medians_ns": [
+        20030.5,
+        19577.5,
+        19736.0,
+        19749.0,
+        19587.0,
+        20239.0
+      ],
+      "relative_round_spread": 0.03350639483348107,
+      "per_request_samples": 6000,
+      "p95_ns": 26173,
+      "p99_ns": 41111,
+      "median_first_row_ns": 19742.5,
+      "sampled_peak_pss_kib": 71984.5,
+      "producer": "materialized-prepared-point"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "point_indexed",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 68599.25,
+      "round_medians_ns": [
+        67818.0,
+        70160.0,
+        67889.0,
+        68596.0,
+        68664.5,
+        68602.5
+      ],
+      "relative_round_spread": 0.03414031494513424,
+      "per_request_samples": 6000,
+      "p95_ns": 82954,
+      "p99_ns": 93840,
+      "median_first_row_ns": 68599.25,
+      "sampled_peak_pss_kib": 71824.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "point_missing",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 61626.75,
+      "round_medians_ns": [
+        61475.0,
+        61418.0,
+        61401.5,
+        62316.0,
+        61866.5,
+        61778.5
+      ],
+      "relative_round_spread": 0.014839335191292742,
+      "per_request_samples": 6000,
+      "p95_ns": 75167,
+      "p99_ns": 89655,
+      "median_first_row_ns": null,
+      "sampled_peak_pss_kib": 71748.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "point_unindexed",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 9108352.5,
+      "round_medians_ns": [
+        8739677.5,
+        9382617.0,
+        8836142.0,
+        9041886.0,
+        9212860.0,
+        9174819.0
+      ],
+      "relative_round_spread": 0.07058790269700256,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 9108352.5,
+      "sampled_peak_pss_kib": 70274.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "range_page",
+      "category": "range",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 101753.5,
+      "round_medians_ns": [
+        88707.5,
+        87558.0,
+        109962.0,
+        110029.5,
+        96111.0,
+        107396.0
+      ],
+      "relative_round_spread": 0.2208425263013066,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 101753.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "filtered_count",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 7728068.25,
+      "round_medians_ns": [
+        7670801.0,
+        8210770.5,
+        7459771.0,
+        7621786.5,
+        7785335.5,
+        7862651.0
+      ],
+      "relative_round_spread": 0.0971781660960357,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 7728068.25,
+      "sampled_peak_pss_kib": 68996.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "and_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 736312.0,
+      "round_medians_ns": [
+        738809.0,
+        735459.5,
+        733575.0,
+        730785.0,
+        738454.5,
+        737164.5
+      ],
+      "relative_round_spread": 0.010897554297634698,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 736312.0,
+      "sampled_peak_pss_kib": 69058.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "or_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 591485.5,
+      "round_medians_ns": [
+        597671.5,
+        586396.0,
+        585077.5,
+        596575.0,
+        584871.5,
+        598075.0
+      ],
+      "relative_round_spread": 0.02232260976811773,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 591485.5,
+      "sampled_peak_pss_kib": 69068.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "indexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 261479.75,
+      "round_medians_ns": [
+        263434.0,
+        261563.0,
+        260739.0,
+        256949.5,
+        263580.5,
+        261396.5
+      ],
+      "relative_round_spread": 0.025359516367902294,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 261479.75,
+      "sampled_peak_pss_kib": 69146.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "unindexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 10282728.5,
+      "round_medians_ns": [
+        10029644.0,
+        10710197.0,
+        10078986.0,
+        10398579.5,
+        10166877.5,
+        10446593.0
+      ],
+      "relative_round_spread": 0.06618408722937691,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 10282728.5,
+      "sampled_peak_pss_kib": 69144.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "unindexed_not_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 11447388.75,
+      "round_medians_ns": [
+        11399948.5,
+        11778917.0,
+        11567463.0,
+        11494829.0,
+        11276476.0,
+        11376397.0
+      ],
+      "relative_round_spread": 0.043891319756219516,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 11447388.75,
+      "sampled_peak_pss_kib": 69149.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "null_count",
+      "category": "nulls",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 8362803.25,
+      "round_medians_ns": [
+        8304287.5,
+        8476793.0,
+        8066824.0,
+        8475632.0,
+        8363973.5,
+        8361633.0
+      ],
+      "relative_round_spread": 0.049022915850615044,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 8362803.25,
+      "sampled_peak_pss_kib": 69149.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "sort_top100",
+      "category": "sorting",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 12065858.25,
+      "round_medians_ns": [
+        11960631.5,
+        12278512.0,
+        12025351.5,
+        12005353.0,
+        12106365.0,
+        12357939.0
+      ],
+      "relative_round_spread": 0.032928241967371034,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 12065858.25,
+      "sampled_peak_pss_kib": 69155.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "pagination_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 40475219.25,
+      "round_medians_ns": [
+        40310917.0,
+        41252485.0,
+        40579311.0,
+        40492527.0,
+        39854249.0,
+        40457911.5
+      ],
+      "relative_round_spread": 0.03454548303651252,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 40475219.25,
+      "sampled_peak_pss_kib": 74703.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "pagination_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 10471085.0,
+      "round_medians_ns": [
+        10160730.0,
+        10651485.0,
+        10566495.0,
+        10157502.5,
+        10375675.0,
+        10997271.5
+      ],
+      "relative_round_spread": 0.08019885236343703,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 10471085.0,
+      "sampled_peak_pss_kib": 69323.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "pagination_pk_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 9385443.25,
+      "round_medians_ns": [
+        9226601.0,
+        9561145.0,
+        9336288.5,
+        9434598.0,
+        9230718.5,
+        9585435.0
+      ],
+      "relative_round_spread": 0.038233037102429875,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 9385443.25,
+      "sampled_peak_pss_kib": 69334.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "pagination_pk_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 149271.5,
+      "round_medians_ns": [
+        149660.5,
+        152051.0,
+        152886.5,
+        148882.5,
+        118832.5,
+        125180.5
+      ],
+      "relative_round_spread": 0.22813464057104002,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 149271.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "sum",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 8369115.75,
+      "round_medians_ns": [
+        8338305.0,
+        8737669.0,
+        8295851.5,
+        8399926.5,
+        8250347.5,
+        9023809.5
+      ],
+      "relative_round_spread": 0.09241860467756106,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 8369115.75,
+      "sampled_peak_pss_kib": 69431.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "avg",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 8585927.75,
+      "round_medians_ns": [
+        8545466.5,
+        8626389.0,
+        8171305.5,
+        8638691.0,
+        8232655.5,
+        8908958.0
+      ],
+      "relative_round_spread": 0.0859141284993925,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 8585927.75,
+      "sampled_peak_pss_kib": 69469.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 15749508.5,
+      "round_medians_ns": [
+        16129335.0,
+        16375230.0,
+        15733477.5,
+        15655756.0,
+        15459784.5,
+        15765539.5
+      ],
+      "relative_round_spread": 0.05812533768910947,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 15749508.5,
+      "sampled_peak_pss_kib": 69476.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "distinct",
+      "category": "set",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 12976335.25,
+      "round_medians_ns": [
+        12718596.5,
+        13330714.5,
+        13034899.0,
+        12917771.5,
+        12648460.5,
+        13109188.5
+      ],
+      "relative_round_spread": 0.05257678588413474,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 12976335.25,
+      "sampled_peak_pss_kib": 69476.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "join_projection",
+      "category": "join",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 1420864.25,
+      "round_medians_ns": [
+        1423461.0,
+        1423184.5,
+        1407109.5,
+        1434899.5,
+        1418544.0,
+        1413538.0
+      ],
+      "relative_round_spread": 0.01955851869733509,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1420864.25,
+      "sampled_peak_pss_kib": 69509.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "compound_join",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 334961.25,
+      "round_medians_ns": [
+        326367.5,
+        321890.5,
+        333260.0,
+        363950.0,
+        407799.5,
+        336662.5
+      ],
+      "relative_round_spread": 0.2564744429392952,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 334961.25,
+      "sampled_peak_pss_kib": null,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "join_group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 22406759.25,
+      "round_medians_ns": [
+        22486415.5,
+        22548486.0,
+        22402946.5,
+        22410572.0,
+        22390782.5,
+        22400219.5
+      ],
+      "relative_round_spread": 0.007038211025541322,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 22406759.25,
+      "sampled_peak_pss_kib": 69545.0,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "exists_correlated",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 751210.5,
+      "round_medians_ns": [
+        750198.5,
+        752222.5,
+        744953.0,
+        752883.0,
+        762261.5,
+        746893.0
+      ],
+      "relative_round_spread": 0.023040812129223435,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 751210.5,
+      "sampled_peak_pss_kib": 69555.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "in_subquery",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 748448.0,
+      "round_medians_ns": [
+        751202.0,
+        753442.5,
+        745694.0,
+        738670.0,
+        739433.5,
+        756926.5
+      ],
+      "relative_round_spread": 0.024392476164008723,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 748448.0,
+      "sampled_peak_pss_kib": 69555.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "case_expression",
+      "category": "expression",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 141388.5,
+      "round_medians_ns": [
+        168200.0,
+        144495.0,
+        174811.0,
+        137483.0,
+        137689.5,
+        138282.0
+      ],
+      "relative_round_spread": 0.2640101564130039,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 141388.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "int64_exact",
+      "category": "types",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 62620.5,
+      "round_medians_ns": [
+        61667.0,
+        62548.5,
+        62578.0,
+        77683.5,
+        62663.0,
+        76902.0
+      ],
+      "relative_round_spread": 0.2557708737553996,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 62620.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "window_rank",
+      "category": "window",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 188643.5,
+      "round_medians_ns": [
+        190394.0,
+        185581.0,
+        229292.0,
+        184211.5,
+        186893.0,
+        233319.5
+      ],
+      "relative_round_spread": 0.2603217179494655,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 188643.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 56784331.5,
+      "round_medians_ns": [
+        56032205,
+        57149776,
+        56869660,
+        56297966,
+        56699003,
+        57213178
+      ],
+      "relative_round_spread": 0.02079751524414794,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 56784331.5,
+      "sampled_peak_pss_kib": 98766.5,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 62107100.0,
+      "round_medians_ns": [
+        62099479,
+        64100678,
+        63089833,
+        61940676,
+        62092767,
+        62114721
+      ],
+      "relative_round_spread": 0.03477866459712336,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 20835601.5,
+      "sampled_peak_pss_kib": 75702.0,
+      "producer": "postgres-portal-256"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 72696118.5,
+      "round_medians_ns": [
+        72078320,
+        73737328,
+        72727495,
+        75487700,
+        72487519,
+        72664742
+      ],
+      "relative_round_spread": 0.04689906518186387,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 72696118.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "postgres-query-rows"
+    },
+    {
+      "engine": "postgres-aa",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 99445835.0,
+      "round_medians_ns": [
+        99895113,
+        101152408,
+        99525875,
+        99151953,
+        99111718,
+        99365795
+      ],
+      "relative_round_spread": 0.02052061808320077,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 333217.5,
+      "sampled_peak_pss_kib": 69437.0,
+      "producer": "postgres-portal-256"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "point_bound",
+      "category": "point_bound",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 32943.25,
+      "round_medians_ns": [
+        32764.5,
+        32731.5,
+        33151.5,
+        32827.0,
+        33059.5,
+        33328.5
+      ],
+      "relative_round_spread": 0.018122073565905002,
+      "per_request_samples": 6000,
+      "p95_ns": 41537,
+      "p99_ns": 51518,
+      "median_first_row_ns": 32943.25,
+      "sampled_peak_pss_kib": 468143.0,
+      "producer": "bound-native-wire-point"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "point_indexed",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 33768.0,
+      "round_medians_ns": [
+        32721.0,
+        33892.0,
+        33644.0,
+        33342.5,
+        34048.0,
+        33980.0
+      ],
+      "relative_round_spread": 0.039297559819947876,
+      "per_request_samples": 6000,
+      "p95_ns": 42153,
+      "p99_ns": 52288,
+      "median_first_row_ns": 33768.0,
+      "sampled_peak_pss_kib": 450711.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "point_missing",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 30590.75,
+      "round_medians_ns": [
+        30606.0,
+        30575.5,
+        30724.5,
+        29974.0,
+        30244.5,
+        30800.0
+      ],
+      "relative_round_spread": 0.02700162630860636,
+      "per_request_samples": 6000,
+      "p95_ns": 37382,
+      "p99_ns": 45736,
+      "median_first_row_ns": null,
+      "sampled_peak_pss_kib": 238063.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "point_unindexed",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 2446339.75,
+      "round_medians_ns": [
+        2287652.0,
+        2351602.5,
+        1984641.0,
+        2541077.0,
+        3352415.5,
+        3230297.5
+      ],
+      "relative_round_spread": 0.5591106059573286,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2446339.75,
+      "sampled_peak_pss_kib": 62473.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "range_page",
+      "category": "range",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 35123522.75,
+      "round_medians_ns": [
+        38320954.5,
+        32908962.5,
+        35901958.0,
+        37762016.0,
+        34345087.5,
+        29334984.5
+      ],
+      "relative_round_spread": 0.2558390872111483,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 35123522.75,
+      "sampled_peak_pss_kib": 203471.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "filtered_count",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 1790965.0,
+      "round_medians_ns": [
+        1649359.0,
+        1757642.0,
+        1650523.5,
+        1824288.0,
+        1925234.5,
+        2144851.5
+      ],
+      "relative_round_spread": 0.276662302166709,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1790965.0,
+      "sampled_peak_pss_kib": 156937.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "and_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 2981789.25,
+      "round_medians_ns": [
+        2744420.5,
+        2975113.0,
+        2692577.5,
+        2988465.5,
+        3355251.0,
+        3307392.0
+      ],
+      "relative_round_spread": 0.22224022036433327,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2981789.25,
+      "sampled_peak_pss_kib": 156993.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "or_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 16374173.75,
+      "round_medians_ns": [
+        16354017.0,
+        16525857.5,
+        16205149.5,
+        16264693.5,
+        16513321.5,
+        16394330.5
+      ],
+      "relative_round_spread": 0.019586209655311614,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 16374173.75,
+      "sampled_peak_pss_kib": 157013.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "indexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 317249.25,
+      "round_medians_ns": [
+        316337.5,
+        316467.5,
+        318031.0,
+        346380.0,
+        318248.5,
+        316328.0
+      ],
+      "relative_round_spread": 0.09472678028395654,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 317249.25,
+      "sampled_peak_pss_kib": 157141.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "unindexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 2911211.0,
+      "round_medians_ns": [
+        2787620.0,
+        3510293.0,
+        2312621.0,
+        2764778.5,
+        3063105.0,
+        3034802.0
+      ],
+      "relative_round_spread": 0.411399929445169,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2911211.0,
+      "sampled_peak_pss_kib": 157205.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "unindexed_not_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 2569073.0,
+      "round_medians_ns": [
+        2217188.0,
+        2472619.0,
+        2785375.0,
+        2665527.0,
+        2313127.0,
+        2983026.0
+      ],
+      "relative_round_spread": 0.298098964101059,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2569073.0,
+      "sampled_peak_pss_kib": 157217.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "null_count",
+      "category": "nulls",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 1968928.5,
+      "round_medians_ns": [
+        1763499.0,
+        2033158.0,
+        1812261.5,
+        1904699.0,
+        2206592.5,
+        2258490.0
+      ],
+      "relative_round_spread": 0.2514012062906297,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1968928.5,
+      "sampled_peak_pss_kib": 157217.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "sort_top100",
+      "category": "sorting",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 50090566.75,
+      "round_medians_ns": [
+        48584116.0,
+        52287387.5,
+        50266320.0,
+        49783130.0,
+        49914813.5,
+        51804375.5
+      ],
+      "relative_round_spread": 0.07393151525880869,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 50090566.75,
+      "sampled_peak_pss_kib": 177659.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "pagination_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 127373271.0,
+      "round_medians_ns": [
+        119694689.0,
+        128612612.5,
+        128376895.5,
+        127240750.5,
+        127505791.5,
+        126231316.0
+      ],
+      "relative_round_spread": 0.0700140887486512,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 127373271.0,
+      "sampled_peak_pss_kib": 275605.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "pagination_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 36379771.75,
+      "round_medians_ns": [
+        35129650.0,
+        37670645.0,
+        36189760.5,
+        36823150.5,
+        36258074.5,
+        36501469.0
+      ],
+      "relative_round_spread": 0.06984637005041132,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 36379771.75,
+      "sampled_peak_pss_kib": 236805.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "pagination_pk_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 66667248.0,
+      "round_medians_ns": [
+        65478515.5,
+        68260387.5,
+        66506857.5,
+        65453362.0,
+        66827638.5,
+        67005157.5
+      ],
+      "relative_round_spread": 0.0421050153442662,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 66667248.0,
+      "sampled_peak_pss_kib": 277719.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "pagination_pk_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 11148791.5,
+      "round_medians_ns": [
+        10884428.0,
+        11254831.0,
+        11195136.5,
+        10841426.5,
+        11102446.5,
+        11399244.5
+      ],
+      "relative_round_spread": 0.0500339431408328,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 11148791.5,
+      "sampled_peak_pss_kib": 277719.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "sum",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 1810718.75,
+      "round_medians_ns": [
+        1544439.5,
+        2341771.0,
+        1870510.0,
+        1617179.0,
+        1750927.5,
+        2329096.0
+      ],
+      "relative_round_spread": 0.440339782199748,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1810718.75,
+      "sampled_peak_pss_kib": 258971.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "avg",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 1937660.0,
+      "round_medians_ns": [
+        1491172.0,
+        2337082.0,
+        1779140.5,
+        2096179.5,
+        1596333.0,
+        2516029.0
+      ],
+      "relative_round_spread": 0.5289147734896731,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1937660.0,
+      "sampled_peak_pss_kib": 258971.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 66717944.25,
+      "round_medians_ns": [
+        65501246.0,
+        67483953.5,
+        66757395.5,
+        66289591.5,
+        66678493.0,
+        68293568.5
+      ],
+      "relative_round_spread": 0.04185264596188453,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 66717944.25,
+      "sampled_peak_pss_kib": 277927.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "distinct",
+      "category": "set",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 116723325.5,
+      "round_medians_ns": [
+        110498635.0,
+        119381461.0,
+        115076718.5,
+        108844201.0,
+        118369932.5,
+        130315828.5
+      ],
+      "relative_round_spread": 0.1839531850898131,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 116723325.5,
+      "sampled_peak_pss_kib": 301245.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "join_projection",
+      "category": "join",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 120945908.75,
+      "round_medians_ns": [
+        121411238.0,
+        102488247.0,
+        122482850.0,
+        108547163.0,
+        120480579.5,
+        128015413.0
+      ],
+      "relative_round_spread": 0.21106266647485916,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 120945908.75,
+      "sampled_peak_pss_kib": 385001.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "compound_join",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 120740377.25,
+      "round_medians_ns": [
+        119078500.5,
+        94768136.0,
+        123716021.5,
+        121664479.0,
+        119816275.5,
+        126951639.0
+      ],
+      "relative_round_spread": 0.2665512874236112,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 120740377.25,
+      "sampled_peak_pss_kib": 463105.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "join_group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 178916740.5,
+      "round_medians_ns": [
+        174431334.5,
+        174002374.0,
+        175386625.0,
+        201605122.0,
+        191688165.5,
+        182446856.0
+      ],
+      "relative_round_spread": 0.15427705603657585,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 178916740.5,
+      "sampled_peak_pss_kib": 436021.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "exists_correlated",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 409095411.75,
+      "round_medians_ns": [
+        408626517.0,
+        411991988.5,
+        406838717.0,
+        409130674.5,
+        409060149.0,
+        412056651.5
+      ],
+      "relative_round_spread": 0.012754810614176975,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 409095411.75,
+      "sampled_peak_pss_kib": 355115.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "in_subquery",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 7190228.5,
+      "round_medians_ns": [
+        5737338.0,
+        7255084.5,
+        7182698.5,
+        6862675.5,
+        7265778.0,
+        7197758.5
+      ],
+      "relative_round_spread": 0.2125718257771641,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 7190228.5,
+      "sampled_peak_pss_kib": 355179.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "case_expression",
+      "category": "expression",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 155593.75,
+      "round_medians_ns": [
+        156911.5,
+        154276.0,
+        162554.0,
+        137328.5,
+        173790.5,
+        139334.5
+      ],
+      "relative_round_spread": 0.2343410323358104,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 155593.75,
+      "sampled_peak_pss_kib": null,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "int64_exact",
+      "category": "types",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 36247.25,
+      "round_medians_ns": [
+        31844.0,
+        39979.5,
+        40284.0,
+        32360.5,
+        40467.0,
+        32515.0
+      ],
+      "relative_round_spread": 0.2378939091931112,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 36247.25,
+      "sampled_peak_pss_kib": null,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "window_rank",
+      "category": "window",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 185103.0,
+      "round_medians_ns": [
+        164641.5,
+        188831.0,
+        205558.0,
+        184144.0,
+        172904.5,
+        186062.0
+      ],
+      "relative_round_spread": 0.22104720074769182,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 185103.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 90827314.0,
+      "round_medians_ns": [
+        87731301,
+        87816985,
+        93123178,
+        94210033,
+        93335643,
+        88531450
+      ],
+      "relative_round_spread": 0.07133021681121166,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 90827314.0,
+      "sampled_peak_pss_kib": 374193.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 94296338.5,
+      "round_medians_ns": [
+        94124506,
+        93787383,
+        99265419,
+        93341985,
+        98718887,
+        94468171
+      ],
+      "relative_round_spread": 0.06281722168883577,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 83392320.5,
+      "sampled_peak_pss_kib": 371845.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 136057960.0,
+      "round_medians_ns": [
+        124458629,
+        130959806,
+        128251178,
+        141192144,
+        144510296,
+        141156114
+      ],
+      "relative_round_spread": 0.1473759197918299,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 136057960.0,
+      "sampled_peak_pss_kib": 476191.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 171604211.0,
+      "round_medians_ns": [
+        160943436,
+        162704648,
+        180536038,
+        163824791,
+        179383631,
+        184528100
+      ],
+      "relative_round_spread": 0.13743639426191004,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 124096442.0,
+      "sampled_peak_pss_kib": 476161.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "point_bound",
+      "category": "point_bound",
+      "delivery": "materialized",
+      "status": "rejected",
+      "reasons": [
+        "unsupported: SQL wire frontend has no parameterized message"
+      ]
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "point_indexed",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 38993.75,
+      "round_medians_ns": [
+        37173.5,
+        39705.5,
+        38899.0,
+        39058.0,
+        38929.5,
+        39155.0
+      ],
+      "relative_round_spread": 0.06493348292995672,
+      "per_request_samples": 6000,
+      "p95_ns": 48356,
+      "p99_ns": 60054,
+      "median_first_row_ns": 38993.75,
+      "sampled_peak_pss_kib": 448431.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "point_missing",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 32331.75,
+      "round_medians_ns": [
+        31743.5,
+        32602.5,
+        35151.0,
+        32355.5,
+        32308.0,
+        31934.5
+      ],
+      "relative_round_spread": 0.10539175887479026,
+      "per_request_samples": 6000,
+      "p95_ns": 44641,
+      "p99_ns": 60465,
+      "median_first_row_ns": null,
+      "sampled_peak_pss_kib": 248331.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "point_unindexed",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 2945668.0,
+      "round_medians_ns": [
+        2818736.5,
+        2381322.5,
+        3005674.5,
+        2885661.5,
+        3432826.0,
+        3523751.5
+      ],
+      "relative_round_spread": 0.3878335915656483,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2945668.0,
+      "sampled_peak_pss_kib": 62605.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "range_page",
+      "category": "range",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 32932841.75,
+      "round_medians_ns": [
+        31148709.5,
+        37009642.0,
+        33741800.5,
+        32588471.0,
+        33277212.5,
+        29092086.5
+      ],
+      "relative_round_spread": 0.24041519283710158,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 32932841.75,
+      "sampled_peak_pss_kib": 193019.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "filtered_count",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 1734796.0,
+      "round_medians_ns": [
+        1740424.0,
+        1621442.5,
+        2177792.0,
+        1729168.0,
+        1673514.5,
+        1820444.5
+      ],
+      "relative_round_spread": 0.3207002437174169,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1734796.0,
+      "sampled_peak_pss_kib": 132017.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "and_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 2699267.0,
+      "round_medians_ns": [
+        2779104.0,
+        2516314.5,
+        3173651.0,
+        2490530.5,
+        2619430.0,
+        2912667.5
+      ],
+      "relative_round_spread": 0.2530762981209343,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2699267.0,
+      "sampled_peak_pss_kib": 132105.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "or_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 16079485.0,
+      "round_medians_ns": [
+        16362962.0,
+        16053395.5,
+        16254204.0,
+        16101917.0,
+        16043267.0,
+        16057053.0
+      ],
+      "relative_round_spread": 0.019882166624117625,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 16079485.0,
+      "sampled_peak_pss_kib": 132365.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "indexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "rejected",
+      "reasons": [
+        "SQL IN lists/subqueries are not supported yet in the SQL frontend"
+      ]
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "unindexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "rejected",
+      "reasons": [
+        "SQL IN lists/subqueries are not supported yet in the SQL frontend"
+      ]
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "unindexed_not_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "rejected",
+      "reasons": [
+        "SQL IN lists/subqueries are not supported yet in the SQL frontend"
+      ]
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "null_count",
+      "category": "nulls",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 1765605.0,
+      "round_medians_ns": [
+        2031127.5,
+        1765884.0,
+        2449775.5,
+        1689629.0,
+        1744627.0,
+        1765326.0
+      ],
+      "relative_round_spread": 0.4305303281311505,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1765605.0,
+      "sampled_peak_pss_kib": 126129.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "sort_top100",
+      "category": "sorting",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 50111897.5,
+      "round_medians_ns": [
+        51590381.0,
+        47796626.5,
+        52833991.5,
+        49252678.0,
+        50634918.5,
+        49588876.5
+      ],
+      "relative_round_spread": 0.10052233603806361,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 50111897.5,
+      "sampled_peak_pss_kib": 186067.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "pagination_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 127342002.25,
+      "round_medians_ns": [
+        127804465.0,
+        119617453.5,
+        131990123.0,
+        129264895.5,
+        123252847.5,
+        126879539.5
+      ],
+      "relative_round_spread": 0.09716094675274356,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 127342002.25,
+      "sampled_peak_pss_kib": 300117.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "pagination_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 36279799.75,
+      "round_medians_ns": [
+        36249476.0,
+        35085061.5,
+        36310123.5,
+        37951450.0,
+        38833069.0,
+        35776053.0
+      ],
+      "relative_round_spread": 0.10330838444057289,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 36279799.75,
+      "sampled_peak_pss_kib": 300185.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "pagination_pk_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 66681383.75,
+      "round_medians_ns": [
+        67929823.5,
+        65907196.5,
+        70845172.5,
+        66244476.5,
+        64510110.0,
+        67118291.0
+      ],
+      "relative_round_spread": 0.09500496456029228,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 66681383.75,
+      "sampled_peak_pss_kib": 302315.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "pagination_pk_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 10948294.5,
+      "round_medians_ns": [
+        11171641.0,
+        11076099.5,
+        11154320.0,
+        10783433.0,
+        10807821.0,
+        10820489.5
+      ],
+      "relative_round_spread": 0.035458308141053385,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 10948294.5,
+      "sampled_peak_pss_kib": 302315.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "sum",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 1753360.25,
+      "round_medians_ns": [
+        1770744.5,
+        1631504.5,
+        2320062.5,
+        2229888.0,
+        1710540.5,
+        1735976.0
+      ],
+      "relative_round_spread": 0.3927076594784215,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1753360.25,
+      "sampled_peak_pss_kib": 271469.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "avg",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 1717695.5,
+      "round_medians_ns": [
+        1721892.5,
+        1655510.5,
+        2293662.0,
+        1861364.0,
+        1663722.0,
+        1713498.5
+      ],
+      "relative_round_spread": 0.37151608070231307,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1717695.5,
+      "sampled_peak_pss_kib": 271469.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 63996317.5,
+      "round_medians_ns": [
+        64503499.5,
+        63939558.0,
+        64633924.5,
+        64053077.0,
+        62445494.5,
+        63639263.5
+      ],
+      "relative_round_spread": 0.0341961863665046,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 63996317.5,
+      "sampled_peak_pss_kib": 301811.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "distinct",
+      "category": "set",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 117795887.25,
+      "round_medians_ns": [
+        117241605.0,
+        119246831.5,
+        122761718.5,
+        118350169.5,
+        113499778.0,
+        109726112.5
+      ],
+      "relative_round_spread": 0.11066265813113098,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 117795887.25,
+      "sampled_peak_pss_kib": 329421.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "join_projection",
+      "category": "join",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 124369086.0,
+      "round_medians_ns": [
+        119617958.5,
+        127243235.0,
+        131085222.0,
+        126158250.0,
+        121882091.0,
+        122579922.0
+      ],
+      "relative_round_spread": 0.09220348777026471,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 124369086.0,
+      "sampled_peak_pss_kib": 419693.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "compound_join",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 123675197.25,
+      "round_medians_ns": [
+        120874871.0,
+        121061344.0,
+        130405628.0,
+        126843725.0,
+        123168624.5,
+        124181770.0
+      ],
+      "relative_round_spread": 0.07706280007570394,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 123675197.25,
+      "sampled_peak_pss_kib": 451021.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "join_group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 138709865.75,
+      "round_medians_ns": [
+        135957951.0,
+        135352502.0,
+        143500034.0,
+        146551900.5,
+        136314520.5,
+        141105211.0
+      ],
+      "relative_round_spread": 0.08073974002818902,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 138709865.75,
+      "sampled_peak_pss_kib": 420825.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "exists_correlated",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "rejected",
+      "reasons": [
+        "SQL EXISTS subqueries are not supported yet; use PowQL EXISTS for now"
+      ]
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "in_subquery",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "rejected",
+      "reasons": [
+        "SQL IN lists/subqueries are not supported yet in the SQL frontend"
+      ]
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "case_expression",
+      "category": "expression",
+      "delivery": "materialized",
+      "status": "rejected",
+      "reasons": [
+        "SQL CASE/WHEN is not supported yet in the SQL frontend; PowQL has it: case when <cond> then <value> else <value> end"
+      ]
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "int64_exact",
+      "category": "types",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 40604.5,
+      "round_medians_ns": [
+        35952.0,
+        46575.5,
+        47327.5,
+        38314.0,
+        37393.0,
+        42895.0
+      ],
+      "relative_round_spread": 0.28015367754805504,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 40604.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "window_rank",
+      "category": "window",
+      "delivery": "materialized",
+      "status": "rejected",
+      "reasons": [
+        "SQL window functions (OVER) are not supported yet in the SQL frontend; PowQL has them: row_number() over (order .col)"
+      ]
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 90168052.0,
+      "round_medians_ns": [
+        90219971,
+        87677899,
+        91027788,
+        90116133,
+        92583884,
+        88481030
+      ],
+      "relative_round_spread": 0.05440934889000375,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 90168052.0,
+      "sampled_peak_pss_kib": 394667.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 97785401.5,
+      "round_medians_ns": [
+        97270881,
+        98279152,
+        97291651,
+        95804910,
+        99565283,
+        99365011
+      ],
+      "relative_round_spread": 0.03845536186707788,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 86953635.5,
+      "sampled_peak_pss_kib": 392365.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 142331403.0,
+      "round_medians_ns": [
+        144669656,
+        138211131,
+        139993150,
+        148157480,
+        134382657,
+        145427663
+      ],
+      "relative_round_spread": 0.09677992846034125,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 142331403.0,
+      "sampled_peak_pss_kib": 500789.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 179900556.5,
+      "round_medians_ns": [
+        179827534,
+        176388958,
+        182600601,
+        171661625,
+        179973579,
+        185317383
+      ],
+      "relative_round_spread": 0.0759072582413051,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 131144473.5,
+      "sampled_peak_pss_kib": 497285.0,
+      "producer": "materialized-native-wire-frame"
+    },
+    {
+      "engine": "sqlite",
+      "case": "point_bound",
+      "category": "point_bound",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 3094.5,
+      "round_medians_ns": [
+        3596.0,
+        3066.5,
+        3664.5,
+        3084.5,
+        2999.5,
+        3104.5
+      ],
+      "relative_round_spread": 0.21489739861043788,
+      "per_request_samples": 6000,
+      "p95_ns": 4441,
+      "p99_ns": 6309,
+      "median_first_row_ns": 3094.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "materialized-prepared-point"
+    },
+    {
+      "engine": "sqlite",
+      "case": "point_indexed",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 5547.0,
+      "round_medians_ns": [
+        5296.0,
+        5708.0,
+        5433.0,
+        6354.5,
+        5604.0,
+        5490.0
+      ],
+      "relative_round_spread": 0.19082386875788715,
+      "per_request_samples": 6000,
+      "p95_ns": 7059,
+      "p99_ns": 11474,
+      "median_first_row_ns": 5547.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "point_missing",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 3575.25,
+      "round_medians_ns": [
+        3080.0,
+        4015.5,
+        3321.0,
+        3829.5,
+        3883.0,
+        3176.0
+      ],
+      "relative_round_spread": 0.2616600237745612,
+      "per_request_samples": 6000,
+      "p95_ns": 4113,
+      "p99_ns": 5068,
+      "median_first_row_ns": null,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "point_unindexed",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 7255810.0,
+      "round_medians_ns": [
+        7308234.0,
+        7193651.0,
+        7287103.5,
+        7145974.0,
+        7224516.5,
+        7664770.5
+      ],
+      "relative_round_spread": 0.07150083863827747,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 7255810.0,
+      "sampled_peak_pss_kib": 4754.0,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "range_page",
+      "category": "range",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 12055.5,
+      "round_medians_ns": [
+        11175.5,
+        12683.0,
+        13329.0,
+        11428.0,
+        13750.0,
+        11427.5
+      ],
+      "relative_round_spread": 0.21355397951142632,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 12055.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "filtered_count",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 6404845.0,
+      "round_medians_ns": [
+        6512054.0,
+        6252894.0,
+        6297636.0,
+        6171650.0,
+        6560287.0,
+        7007061.5
+      ],
+      "relative_round_spread": 0.1304343040307767,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 6404845.0,
+      "sampled_peak_pss_kib": 4696.0,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "and_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 205980.75,
+      "round_medians_ns": [
+        208040.0,
+        207779.0,
+        204860.0,
+        199875.0,
+        207101.5,
+        200620.0
+      ],
+      "relative_round_spread": 0.03963962651849748,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 205980.75,
+      "sampled_peak_pss_kib": 4726.0,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "or_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 170301.5,
+      "round_medians_ns": [
+        170397.5,
+        171085.5,
+        172549.5,
+        166378.5,
+        170024.5,
+        170205.5
+      ],
+      "relative_round_spread": 0.03623573485847159,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 170301.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "indexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 55563.0,
+      "round_medians_ns": [
+        53989.5,
+        53605.5,
+        69404.5,
+        68743.0,
+        55561.5,
+        55564.5
+      ],
+      "relative_round_spread": 0.28434389791767906,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 55563.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "unindexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 8127617.0,
+      "round_medians_ns": [
+        8242017.0,
+        7907435.0,
+        7810888.0,
+        8139883.5,
+        8115350.5,
+        8491446.5
+      ],
+      "relative_round_spread": 0.08373407605205806,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 8127617.0,
+      "sampled_peak_pss_kib": 4806.0,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "unindexed_not_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 11522921.5,
+      "round_medians_ns": [
+        11567045.0,
+        11137471.0,
+        11100298.0,
+        11607946.5,
+        11478798.0,
+        11797675.5
+      ],
+      "relative_round_spread": 0.06052089307386152,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 11522921.5,
+      "sampled_peak_pss_kib": 4808.0,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "null_count",
+      "category": "nulls",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 6602411.25,
+      "round_medians_ns": [
+        6723609.5,
+        6315524.0,
+        6357291.5,
+        6481213.0,
+        6766008.0,
+        6883182.5
+      ],
+      "relative_round_spread": 0.08597745255568562,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 6602411.25,
+      "sampled_peak_pss_kib": 4808.0,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "sort_top100",
+      "category": "sorting",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 8075748.5,
+      "round_medians_ns": [
+        8220261.0,
+        7708168.5,
+        7931374.5,
+        8100514.0,
+        8050983.0,
+        8110126.5
+      ],
+      "relative_round_spread": 0.06341115006243693,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 8075748.5,
+      "sampled_peak_pss_kib": 4808.0,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "pagination_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 54666313.5,
+      "round_medians_ns": [
+        54622751.0,
+        54624040.0,
+        54057754.5,
+        55104501.0,
+        54708587.0,
+        54802635.0
+      ],
+      "relative_round_spread": 0.019147925531872566,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 54666313.5,
+      "sampled_peak_pss_kib": 6102.0,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "pagination_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 7972251.25,
+      "round_medians_ns": [
+        8080214.5,
+        7762764.5,
+        7746520.0,
+        8046778.0,
+        7897724.5,
+        8285034.0
+      ],
+      "relative_round_spread": 0.0675485484730552,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 7972251.25,
+      "sampled_peak_pss_kib": 5102.0,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "pagination_pk_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 2897991.5,
+      "round_medians_ns": [
+        2927168.0,
+        2829995.0,
+        2847489.5,
+        2868815.0,
+        2969012.0,
+        3330289.0
+      ],
+      "relative_round_spread": 0.17263473685136757,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2897991.5,
+      "sampled_peak_pss_kib": 4984.0,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "pagination_pk_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 22269.0,
+      "round_medians_ns": [
+        22008.0,
+        21180.0,
+        22794.5,
+        19111.5,
+        22826.5,
+        22530.0
+      ],
+      "relative_round_spread": 0.16682383582558713,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 22269.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "sum",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 6597338.25,
+      "round_medians_ns": [
+        6771336.5,
+        6232175.5,
+        6401873.0,
+        6435580.5,
+        6759096.0,
+        6844111.5
+      ],
+      "relative_round_spread": 0.0927549834207758,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 6597338.25,
+      "sampled_peak_pss_kib": 4984.0,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "avg",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 6631378.0,
+      "round_medians_ns": [
+        6645733.5,
+        6617022.5,
+        6544287.5,
+        6359664.0,
+        6691031.5,
+        6971345.5
+      ],
+      "relative_round_spread": 0.09224048154094067,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 6631378.0,
+      "sampled_peak_pss_kib": 4984.0,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 31874332.5,
+      "round_medians_ns": [
+        32040409.0,
+        31842908.0,
+        31516387.0,
+        31641886.0,
+        31905757.0,
+        32424081.0
+      ],
+      "relative_round_spread": 0.028477270857358346,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 31874332.5,
+      "sampled_peak_pss_kib": 7240.0,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "distinct",
+      "category": "set",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 27548914.0,
+      "round_medians_ns": [
+        28146255.0,
+        27410702.0,
+        27590374.0,
+        27240542.0,
+        27507454.0,
+        28241572.5
+      ],
+      "relative_round_spread": 0.03633647772830537,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 27548914.0,
+      "sampled_peak_pss_kib": 7240.0,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "join_projection",
+      "category": "join",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 434439.0,
+      "round_medians_ns": [
+        434506.0,
+        428177.5,
+        498834.5,
+        412659.5,
+        485992.5,
+        434372.0
+      ],
+      "relative_round_spread": 0.1983592633258064,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 434439.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "compound_join",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 56236.0,
+      "round_medians_ns": [
+        56874.0,
+        55976.0,
+        45458.5,
+        45849.0,
+        56789.0,
+        56496.0
+      ],
+      "relative_round_spread": 0.20299274486094318,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 56236.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "join_group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 37443057.75,
+      "round_medians_ns": [
+        37474699.5,
+        37189685.0,
+        37229628.0,
+        37440914.5,
+        37445201.0,
+        38000821.5
+      ],
+      "relative_round_spread": 0.021663201371421116,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 37443057.75,
+      "sampled_peak_pss_kib": 7948.0,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "exists_correlated",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 111479.0,
+      "round_medians_ns": [
+        100116.5,
+        100781.0,
+        101065.5,
+        125031.5,
+        121892.5,
+        125955.0
+      ],
+      "relative_round_spread": 0.23177907946788184,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 111479.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "in_subquery",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 137851.25,
+      "round_medians_ns": [
+        109696.0,
+        138254.0,
+        140141.5,
+        112035.0,
+        137968.0,
+        137734.5
+      ],
+      "relative_round_spread": 0.2208576273338109,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 137851.25,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "case_expression",
+      "category": "expression",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 23457.5,
+      "round_medians_ns": [
+        24294.5,
+        29898.0,
+        22242.0,
+        22620.5,
+        28436.0,
+        21710.5
+      ],
+      "relative_round_spread": 0.34903548971544285,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 23457.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "int64_exact",
+      "category": "types",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 3898.25,
+      "round_medians_ns": [
+        3875.0,
+        3751.5,
+        3923.0,
+        3921.5,
+        3947.5,
+        3835.0
+      ],
+      "relative_round_spread": 0.05027897133329058,
+      "per_request_samples": 300,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 3898.25,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "window_rank",
+      "category": "window",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 97402.5,
+      "round_medians_ns": [
+        154296.0,
+        101266.0,
+        82078.0,
+        102673.0,
+        93539.0,
+        86664.0
+      ],
+      "relative_round_spread": 0.7414388747722082,
+      "per_request_samples": 120,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 97402.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 15154499.5,
+      "round_medians_ns": [
+        15132560,
+        14836507,
+        14784185,
+        15254110,
+        15176439,
+        15529774
+      ],
+      "relative_round_spread": 0.049199183384446316,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 15154499.5,
+      "sampled_peak_pss_kib": 14584.0,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 21720171.5,
+      "round_medians_ns": [
+        21705109,
+        21735234,
+        21585538,
+        21462000,
+        21746437,
+        22148063
+      ],
+      "relative_round_spread": 0.03158644488603601,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 40759.0,
+      "sampled_peak_pss_kib": 4411.0,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 27495551.0,
+      "round_medians_ns": [
+        27613590,
+        27051515,
+        29895300,
+        27082494,
+        27573946,
+        27417156
+      ],
+      "relative_round_spread": 0.10342709626004586,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 27495551.0,
+      "sampled_peak_pss_kib": 35620.5,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 60007268.5,
+      "round_medians_ns": [
+        59990731,
+        60023806,
+        60952216,
+        59282980,
+        59539494,
+        60782969
+      ],
+      "relative_round_spread": 0.027817230174374628,
+      "per_request_samples": 18,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 42038.0,
+      "sampled_peak_pss_kib": 4456.0,
+      "producer": "sqlite-step-cursor"
+    }
+  ],
+  "cohorts": {
+    "embedded_native": {
+      "sampled_delivery_pss_score": {
+        "sqlite": null
+      },
+      "memory_cases": [],
+      "memory_reasons": [
+        "missing/incorrect delivery observations or sampled PSS A/A differs by more than 20%"
+      ],
+      "participants": [
+        "sqlite",
+        "duckdb",
+        "powdb-powql"
+      ],
+      "measured": [
+        "sqlite"
+      ],
+      "common_cases": [],
+      "query_coverage": {
+        "sqlite": {
+          "correct": 33,
+          "required": 33
+        }
+      },
+      "common_query_latency_score": {
+        "sqlite": null
+      },
+      "reasons": [
+        "a common workload failed identical-binary A/A calibration",
+        "a common workload failed request-count or stability gates",
+        "one or more registered cohort engines were not measured"
+      ],
+      "correctness_failed": [],
+      "excluded_cases": [
+        {
+          "case": "point_bound",
+          "delivery": "materialized"
+        },
+        {
+          "case": "point_indexed",
+          "delivery": "materialized"
+        },
+        {
+          "case": "point_missing",
+          "delivery": "materialized"
+        },
+        {
+          "case": "point_unindexed",
+          "delivery": "materialized"
+        },
+        {
+          "case": "range_page",
+          "delivery": "materialized"
+        },
+        {
+          "case": "filtered_count",
+          "delivery": "materialized"
+        },
+        {
+          "case": "and_projection",
+          "delivery": "materialized"
+        },
+        {
+          "case": "or_projection",
+          "delivery": "materialized"
+        },
+        {
+          "case": "indexed_in",
+          "delivery": "materialized"
+        },
+        {
+          "case": "unindexed_in",
+          "delivery": "materialized"
+        },
+        {
+          "case": "unindexed_not_in",
+          "delivery": "materialized"
+        },
+        {
+          "case": "null_count",
+          "delivery": "materialized"
+        },
+        {
+          "case": "sort_top100",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_offset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_keyset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_pk_offset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_pk_keyset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "sum",
+          "delivery": "materialized"
+        },
+        {
+          "case": "avg",
+          "delivery": "materialized"
+        },
+        {
+          "case": "group_having",
+          "delivery": "materialized"
+        },
+        {
+          "case": "distinct",
+          "delivery": "materialized"
+        },
+        {
+          "case": "join_projection",
+          "delivery": "materialized"
+        },
+        {
+          "case": "compound_join",
+          "delivery": "materialized"
+        },
+        {
+          "case": "join_group_having",
+          "delivery": "materialized"
+        },
+        {
+          "case": "exists_correlated",
+          "delivery": "materialized"
+        },
+        {
+          "case": "in_subquery",
+          "delivery": "materialized"
+        },
+        {
+          "case": "case_expression",
+          "delivery": "materialized"
+        },
+        {
+          "case": "int64_exact",
+          "delivery": "materialized"
+        },
+        {
+          "case": "window_rank",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_narrow",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_narrow",
+          "delivery": "consume"
+        },
+        {
+          "case": "all_rows_wide",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_wide",
+          "delivery": "consume"
+        }
+      ],
+      "interpretation": "100 equals the fastest observed median in every included common case; no universal or cross-cohort ranking."
+    },
+    "embedded_sql": {
+      "sampled_delivery_pss_score": {
+        "sqlite": null
+      },
+      "memory_cases": [],
+      "memory_reasons": [
+        "missing/incorrect delivery observations or sampled PSS A/A differs by more than 20%"
+      ],
+      "participants": [
+        "sqlite",
+        "duckdb",
+        "powdb-sql"
+      ],
+      "measured": [
+        "sqlite"
+      ],
+      "common_cases": [],
+      "query_coverage": {
+        "sqlite": {
+          "correct": 33,
+          "required": 33
+        }
+      },
+      "common_query_latency_score": {
+        "sqlite": null
+      },
+      "reasons": [
+        "a common workload failed identical-binary A/A calibration",
+        "a common workload failed request-count or stability gates",
+        "one or more registered cohort engines were not measured"
+      ],
+      "correctness_failed": [],
+      "excluded_cases": [
+        {
+          "case": "point_bound",
+          "delivery": "materialized"
+        },
+        {
+          "case": "point_indexed",
+          "delivery": "materialized"
+        },
+        {
+          "case": "point_missing",
+          "delivery": "materialized"
+        },
+        {
+          "case": "point_unindexed",
+          "delivery": "materialized"
+        },
+        {
+          "case": "range_page",
+          "delivery": "materialized"
+        },
+        {
+          "case": "filtered_count",
+          "delivery": "materialized"
+        },
+        {
+          "case": "and_projection",
+          "delivery": "materialized"
+        },
+        {
+          "case": "or_projection",
+          "delivery": "materialized"
+        },
+        {
+          "case": "indexed_in",
+          "delivery": "materialized"
+        },
+        {
+          "case": "unindexed_in",
+          "delivery": "materialized"
+        },
+        {
+          "case": "unindexed_not_in",
+          "delivery": "materialized"
+        },
+        {
+          "case": "null_count",
+          "delivery": "materialized"
+        },
+        {
+          "case": "sort_top100",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_offset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_keyset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_pk_offset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_pk_keyset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "sum",
+          "delivery": "materialized"
+        },
+        {
+          "case": "avg",
+          "delivery": "materialized"
+        },
+        {
+          "case": "group_having",
+          "delivery": "materialized"
+        },
+        {
+          "case": "distinct",
+          "delivery": "materialized"
+        },
+        {
+          "case": "join_projection",
+          "delivery": "materialized"
+        },
+        {
+          "case": "compound_join",
+          "delivery": "materialized"
+        },
+        {
+          "case": "join_group_having",
+          "delivery": "materialized"
+        },
+        {
+          "case": "exists_correlated",
+          "delivery": "materialized"
+        },
+        {
+          "case": "in_subquery",
+          "delivery": "materialized"
+        },
+        {
+          "case": "case_expression",
+          "delivery": "materialized"
+        },
+        {
+          "case": "int64_exact",
+          "delivery": "materialized"
+        },
+        {
+          "case": "window_rank",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_narrow",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_narrow",
+          "delivery": "consume"
+        },
+        {
+          "case": "all_rows_wide",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_wide",
+          "delivery": "consume"
+        }
+      ],
+      "interpretation": "100 equals the fastest observed median in every included common case; no universal or cross-cohort ranking."
+    },
+    "server_native": {
+      "sampled_delivery_pss_score": {
+        "postgres": null,
+        "mysql": null,
+        "powdb-server": null
+      },
+      "memory_cases": [
+        {
+          "case": "all_rows_narrow",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_narrow",
+          "delivery": "consume"
+        },
+        {
+          "case": "all_rows_wide",
+          "delivery": "consume"
+        }
+      ],
+      "memory_reasons": [
+        "missing/incorrect delivery observations or sampled PSS A/A differs by more than 20%"
+      ],
+      "participants": [
+        "postgres",
+        "mysql",
+        "powdb-server"
+      ],
+      "measured": [
+        "postgres",
+        "mysql",
+        "powdb-server"
+      ],
+      "common_cases": [
+        {
+          "case": "point_bound",
+          "delivery": "materialized"
+        },
+        {
+          "case": "point_indexed",
+          "delivery": "materialized"
+        },
+        {
+          "case": "point_missing",
+          "delivery": "materialized"
+        },
+        {
+          "case": "or_projection",
+          "delivery": "materialized"
+        },
+        {
+          "case": "indexed_in",
+          "delivery": "materialized"
+        },
+        {
+          "case": "sort_top100",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_offset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_keyset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_pk_offset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "group_having",
+          "delivery": "materialized"
+        },
+        {
+          "case": "distinct",
+          "delivery": "materialized"
+        },
+        {
+          "case": "join_group_having",
+          "delivery": "materialized"
+        },
+        {
+          "case": "exists_correlated",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_narrow",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_narrow",
+          "delivery": "consume"
+        },
+        {
+          "case": "all_rows_wide",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_wide",
+          "delivery": "consume"
+        }
+      ],
+      "query_coverage": {
+        "postgres": {
+          "correct": 33,
+          "required": 33
+        },
+        "mysql": {
+          "correct": 33,
+          "required": 33
+        },
+        "powdb-server": {
+          "correct": 33,
+          "required": 33
+        }
+      },
+      "common_query_latency_score": {
+        "postgres": null,
+        "mysql": null,
+        "powdb-server": null
+      },
+      "reasons": [
+        "a common workload failed request-count or stability gates"
+      ],
+      "correctness_failed": [],
+      "excluded_cases": [
+        {
+          "case": "point_unindexed",
+          "delivery": "materialized"
+        },
+        {
+          "case": "range_page",
+          "delivery": "materialized"
+        },
+        {
+          "case": "filtered_count",
+          "delivery": "materialized"
+        },
+        {
+          "case": "and_projection",
+          "delivery": "materialized"
+        },
+        {
+          "case": "unindexed_in",
+          "delivery": "materialized"
+        },
+        {
+          "case": "unindexed_not_in",
+          "delivery": "materialized"
+        },
+        {
+          "case": "null_count",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_pk_keyset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "sum",
+          "delivery": "materialized"
+        },
+        {
+          "case": "avg",
+          "delivery": "materialized"
+        },
+        {
+          "case": "join_projection",
+          "delivery": "materialized"
+        },
+        {
+          "case": "compound_join",
+          "delivery": "materialized"
+        },
+        {
+          "case": "in_subquery",
+          "delivery": "materialized"
+        },
+        {
+          "case": "case_expression",
+          "delivery": "materialized"
+        },
+        {
+          "case": "int64_exact",
+          "delivery": "materialized"
+        },
+        {
+          "case": "window_rank",
+          "delivery": "materialized"
+        }
+      ],
+      "interpretation": "100 equals the fastest observed median in every included common case; no universal or cross-cohort ranking."
+    },
+    "server_sql": {
+      "sampled_delivery_pss_score": {
+        "postgres": null,
+        "mysql": null,
+        "powdb-server-sql": null
+      },
+      "memory_cases": [
+        {
+          "case": "all_rows_narrow",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_narrow",
+          "delivery": "consume"
+        },
+        {
+          "case": "all_rows_wide",
+          "delivery": "consume"
+        }
+      ],
+      "memory_reasons": [
+        "missing/incorrect delivery observations or sampled PSS A/A differs by more than 20%"
+      ],
+      "participants": [
+        "postgres",
+        "mysql",
+        "powdb-server-sql"
+      ],
+      "measured": [
+        "postgres",
+        "mysql",
+        "powdb-server-sql"
+      ],
+      "common_cases": [
+        {
+          "case": "point_indexed",
+          "delivery": "materialized"
+        },
+        {
+          "case": "point_missing",
+          "delivery": "materialized"
+        },
+        {
+          "case": "or_projection",
+          "delivery": "materialized"
+        },
+        {
+          "case": "sort_top100",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_offset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_keyset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_pk_offset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "group_having",
+          "delivery": "materialized"
+        },
+        {
+          "case": "distinct",
+          "delivery": "materialized"
+        },
+        {
+          "case": "join_projection",
+          "delivery": "materialized"
+        },
+        {
+          "case": "join_group_having",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_narrow",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_narrow",
+          "delivery": "consume"
+        },
+        {
+          "case": "all_rows_wide",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_wide",
+          "delivery": "consume"
+        }
+      ],
+      "query_coverage": {
+        "postgres": {
+          "correct": 33,
+          "required": 33
+        },
+        "mysql": {
+          "correct": 33,
+          "required": 33
+        },
+        "powdb-server-sql": {
+          "correct": 25,
+          "required": 33
+        }
+      },
+      "common_query_latency_score": {
+        "postgres": null,
+        "mysql": null,
+        "powdb-server-sql": null
+      },
+      "reasons": [
+        "a common workload failed request-count or stability gates"
+      ],
+      "correctness_failed": [],
+      "excluded_cases": [
+        {
+          "case": "point_bound",
+          "delivery": "materialized"
+        },
+        {
+          "case": "point_unindexed",
+          "delivery": "materialized"
+        },
+        {
+          "case": "range_page",
+          "delivery": "materialized"
+        },
+        {
+          "case": "filtered_count",
+          "delivery": "materialized"
+        },
+        {
+          "case": "and_projection",
+          "delivery": "materialized"
+        },
+        {
+          "case": "indexed_in",
+          "delivery": "materialized"
+        },
+        {
+          "case": "unindexed_in",
+          "delivery": "materialized"
+        },
+        {
+          "case": "unindexed_not_in",
+          "delivery": "materialized"
+        },
+        {
+          "case": "null_count",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_pk_keyset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "sum",
+          "delivery": "materialized"
+        },
+        {
+          "case": "avg",
+          "delivery": "materialized"
+        },
+        {
+          "case": "compound_join",
+          "delivery": "materialized"
+        },
+        {
+          "case": "exists_correlated",
+          "delivery": "materialized"
+        },
+        {
+          "case": "in_subquery",
+          "delivery": "materialized"
+        },
+        {
+          "case": "case_expression",
+          "delivery": "materialized"
+        },
+        {
+          "case": "int64_exact",
+          "delivery": "materialized"
+        },
+        {
+          "case": "window_rank",
+          "delivery": "materialized"
+        }
+      ],
+      "interpretation": "100 equals the fastest observed median in every included common case; no universal or cross-cohort ranking."
+    }
+  },
+  "calibration": [
+    {
+      "engine": "sqlite",
+      "case": "point_bound",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "point_indexed",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "point_missing",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "point_unindexed",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "range_page",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "filtered_count",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "and_projection",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "or_projection",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "indexed_in",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "unindexed_in",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "unindexed_not_in",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "null_count",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "sort_top100",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "pagination_offset",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "pagination_keyset",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "pagination_pk_offset",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "pagination_pk_keyset",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "sum",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "avg",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "group_having",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "distinct",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "join_projection",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "compound_join",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "join_group_having",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "exists_correlated",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "in_subquery",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "case_expression",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "int64_exact",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "window_rank",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "all_rows_narrow",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "all_rows_narrow",
+      "delivery": "consume",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "all_rows_wide",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "sqlite",
+      "case": "all_rows_wide",
+      "delivery": "consume",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "point_bound",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 0.008569713534017032,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "point_indexed",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 0.0009739904424908019,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "point_missing",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.003698135169871719,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "point_unindexed",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 0.002703275001812333,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "range_page",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "filtered_count",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.011746057808892374,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "and_projection",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 0.0005904515357515461,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "or_projection",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.012834303138229086,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "indexed_in",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.005506270740032848,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "unindexed_in",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.010821701988581789,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "unindexed_not_in",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.026998927839720244,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "null_count",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.024210515752988382,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "sort_top100",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.007490670901126761,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "pagination_offset",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.011872998744682728,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "pagination_keyset",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.011142382866865863,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "pagination_pk_offset",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.018522127790592924,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "pagination_pk_keyset",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "sum",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.026425793461746783,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "avg",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 0.004097555926926955,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "group_having",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.0039058387154006224,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "distinct",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 0.005820115006698767,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "join_projection",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.001327707387068,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "compound_join",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "join_group_having",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.0006790210817314568,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "exists_correlated",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 0.003895855279049343,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "in_subquery",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 8.685392372620448e-05,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "case_expression",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "int64_exact",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "window_rank",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "all_rows_narrow",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 0.0028168651181927906,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "all_rows_narrow",
+      "delivery": "consume",
+      "pass_gate": true,
+      "relative_delta": -0.007688433043706255,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "all_rows_wide",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 0.004342694691571447,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "all_rows_wide",
+      "delivery": "consume",
+      "pass_gate": true,
+      "relative_delta": -0.0029476987921316367,
+      "same_binary": true
+    }
+  ]
+}

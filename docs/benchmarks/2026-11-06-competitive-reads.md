@@ -6,6 +6,9 @@ Full methodology: [cross-engine baseline](competitive-baseline.md). Documented c
 
 ![Selected embedded medians with failed-noise cases hatched](2026-11-06-competitive-reads.png)
 
+Newer evidence: [complete 100K collections](2026-11-06-competitive-100k.md).
+The runner CPUs differ, so these are not controlled scaling measurements.
+
 ## Provenance
 
 - [Complete hosted run and build logs](https://github.com/ZVN-DEV/powdb/actions/runs/42334103067).
@@ -79,7 +82,7 @@ SQL memory reasons: missing/incorrect delivery observations or sampled PSS A/A d
 
 ### Delivery memory and first available application row
 
-PSS is sampled resident memory in KiB, not total RAM or a guaranteed allocation peak. `unknown` means that valid evidence requirements were not met. First-row latency is microseconds and is measured at complete application availability for materialization. Each delivery mode reopens its client/embedded engine before its own warmup. Server buffers remain resident.
+PSS is sampled resident memory in KiB, not total RAM or a guaranteed allocation peak. `unknown` means that valid evidence requirements were not met. First-row latency is microseconds and is measured at complete application availability for materialization. Each delivery mode reopens its client/embedded engine before its own warmup. Server buffers and allocator state from fixture loading remain resident.
 
 | Engine / case / mode | Sampled peak PSS (KiB) | First row (microseconds) |
 | --- | ---: | ---: |
@@ -160,7 +163,7 @@ SQL memory reasons: missing/incorrect delivery observations or sampled PSS A/A d
 
 ### Delivery memory and first available application row
 
-PSS is sampled resident memory in KiB, not total RAM or a guaranteed allocation peak. `unknown` means that valid evidence requirements were not met. First-row latency is microseconds and is measured at complete application availability for materialization. Each delivery mode reopens its client/embedded engine before its own warmup. Server buffers remain resident.
+PSS is sampled resident memory in KiB, not total RAM or a guaranteed allocation peak. `unknown` means that valid evidence requirements were not met. First-row latency is microseconds and is measured at complete application availability for materialization. Each delivery mode reopens its client/embedded engine before its own warmup. Server buffers and allocator state from fixture loading remain resident.
 
 | Engine / case / mode | Sampled peak PSS (KiB) | First row (microseconds) |
 | --- | ---: | ---: |
