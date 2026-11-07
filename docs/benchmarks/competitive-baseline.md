@@ -128,9 +128,12 @@ allocation peaks can be missed. This is **sampled resident memory**, not total
 machine memory, allocator high-water usage or a guaranteed peak. Reading `/proc`
 can fail for a container process; such memory remains unknown, never zero.
 
-Per-case memory includes resident state left by previous workloads, protocol and
-collector-result serialization within the sampling interval. Loading allocations
-are excluded by the separate loader process. Use delivery-case memory scores as
+Delivery cases reopen the client/embedded worker before each delivery mode,
+then warm up that mode. This prevents a preceding materialization's retained
+client heap from being attributed to streaming. Owned servers retain their
+normal resident caches/buffers. Other cases can retain state from previous
+workloads. Protocol and result-summary serialization are inside the memory
+sampling interval. Loading allocations are excluded by the separate loader. Use delivery-case memory scores as
 a workload-specific observation, not an independent allocation attribution.
 
 Actual settings accompany each record: versions, durability, memory and thread

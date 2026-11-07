@@ -191,7 +191,9 @@ def score(data):
                     values = [s["elapsed_ns"] for s in samples]
                     timings.extend(values)
                     round_medians.append(statistics.median(values))
-                    first_rows.extend(s["first_row_ns"] for s in samples if s.get("first_row_ns") is not None)
+                    round_first = [s["first_row_ns"] for s in samples if s.get("first_row_ns") is not None]
+                    if round_first:
+                        first_rows.append(statistics.median(round_first))
                 if cell["status"] != "correct":
                     cell["reasons"] = sorted(set(cell["reasons"]))
                     cells[key] = cell

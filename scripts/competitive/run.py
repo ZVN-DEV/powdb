@@ -293,6 +293,13 @@ def run(args):
                 workload_order = selected[round_number % len(selected):]+selected[:round_number % len(selected)]
                 for workload in workload_order:
                     for delivery in workload["deliveries"]:
+                        if workload["category"] == "delivery":
+                            # A fresh client/embedded engine prevents a prior
+                            # materialized result's retained heap from being
+                            # attributed to bounded consumption. Owned servers
+                            # keep their normal resident buffer/cache state.
+                            worker.close()
+                            worker = Worker(binary, backend, root, args.rows, "query", args.cpu, args.timeout)
                         count = min(workload["iterations"], args.max_iterations)
                         queries = [query_for(workload, backend, i, params) for i in range(count)]
                         ids = [id_for(i,params) for i in range(count)] if workload.get("prepared") else None
