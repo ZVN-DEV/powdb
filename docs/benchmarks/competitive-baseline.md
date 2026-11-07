@@ -109,7 +109,9 @@ Two delivery modes have different timing boundaries:
 - **Consume:** retain only a digest and up to three preview rows. Row conversion
   and hashing are timed. First-row latency is measured at the visitor callback.
   SQLite steps rows; DuckDB uses `stream_arrow`, not its materializing `query()`;
-  PostgreSQL fetches bounded 256-row portals; MySQL uses its result iterator.
+  PostgreSQL fetches bounded 256-row portals for consumption (including explicit
+  transaction/portal round trips) and uses its normal complete-result query API
+  for materialization; MySQL uses its result iterator.
   PowDB currently materializes its engine result and native wire frame before
   visiting rows. Calling it `consume` does not turn PowDB into a streaming engine.
 

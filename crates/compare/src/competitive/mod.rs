@@ -12,6 +12,9 @@ type Result<T> = std::result::Result<T, String>;
 trait Database {
     fn command(&mut self, query: &str) -> Result<()>;
     fn visit(&mut self, query: &str, visitor: &mut dyn FnMut(Row)) -> Result<()>;
+    fn visit_materialized(&mut self, query: &str, visitor: &mut dyn FnMut(Row)) -> Result<()> {
+        self.visit(query, visitor)
+    }
     fn metadata(&mut self) -> Result<Value>;
     fn source_language(&self) -> &'static str {
         "sql"
@@ -90,7 +93,7 @@ fn measure(database: &mut dyn Database, request: Request) -> Value {
         let (outcome, elapsed_ns, preview) = match request.delivery {
             Delivery::Materialized => {
                 let mut rows = Vec::new();
-                let result = database.visit(query, &mut |row| rows.push(row));
+                let result = database.visit_materialized(query, &mut |row| rows.push(row));
                 // Full application result materialization belongs inside
                 // timing for EVERY engine in this delivery cohort.
                 let elapsed = start.elapsed().as_nanos();

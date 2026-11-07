@@ -38,6 +38,7 @@ pub(super) fn open(engine: &str, directory: &Path, prepare: bool) -> Result<Box<
                 .host_path(directory.join("pg-socket"))
                 .user("bench")
                 .dbname("postgres")
+                .options("-c max_parallel_workers_per_gather=0")
                 .connect(postgres::NoTls)
                 .map_err(|e| e.to_string())?;
             Ok(Box::new(Postgres(connection)))
@@ -560,7 +561,6 @@ impl Database for Postgres {
         self.0.batch_execute(query).map_err(|e| e.to_string())
     }
     fn visit(&mut self, query: &str, visitor: &mut dyn FnMut(Row)) -> Result<()> {
-        use postgres::types::Type;
         // A portal fetches bounded batches. The transaction is deliberate and
         // counted, including server-side blocking work before the first row.
         let mut transaction = self.0.transaction().map_err(|e| e.to_string())?;
@@ -573,44 +573,18 @@ impl Database for Postgres {
                 break;
             }
             for row in rows {
-                let mut values = Vec::with_capacity(row.len());
-                for (index, column) in row.columns().iter().enumerate() {
-                    let value = match *column.type_() {
-                        Type::INT8 => row
-                            .try_get::<_, Option<i64>>(index)
-                            .map(|v| v.map_or(Value::Null, |v| json!(v))),
-                        Type::INT4 => row
-                            .try_get::<_, Option<i32>>(index)
-                            .map(|v| v.map_or(Value::Null, |v| json!(v))),
-                        Type::INT2 => row
-                            .try_get::<_, Option<i16>>(index)
-                            .map(|v| v.map_or(Value::Null, |v| json!(v))),
-                        Type::FLOAT8 => row
-                            .try_get::<_, Option<f64>>(index)
-                            .map(|v| v.map_or(Value::Null, |v| json!(v))),
-                        Type::FLOAT4 => row
-                            .try_get::<_, Option<f32>>(index)
-                            .map(|v| v.map_or(Value::Null, |v| json!(v))),
-                        Type::BOOL => row
-                            .try_get::<_, Option<bool>>(index)
-                            .map(|v| v.map_or(Value::Null, |v| json!(v))),
-                        Type::TEXT | Type::VARCHAR | Type::BPCHAR => row
-                            .try_get::<_, Option<String>>(index)
-                            .map(|v| v.map_or(Value::Null, |v| json!(v))),
-                        _ => {
-                            return Err(format!(
-                                "adapter: unhandled PostgreSQL type {}",
-                                column.type_()
-                            ))
-                        }
-                    }
-                    .map_err(|e| e.to_string())?;
-                    values.push(value);
-                }
-                visitor(values);
+                visitor(postgres_row(row)?);
             }
         }
         transaction.commit().map_err(|e| e.to_string())
+    }
+    fn visit_materialized(&mut self, query: &str, visitor: &mut dyn FnMut(Row)) -> Result<()> {
+        // Use the normal complete-result API for materialization. Explicit
+        // portal/transaction round trips belong only to the consumption probe.
+        for row in self.0.query(query, &[]).map_err(|e| e.to_string())? {
+            visitor(postgres_row(row)?);
+        }
+        Ok(())
     }
     fn metadata(&mut self) -> Result<Value> {
         let mut settings = serde_json::Map::new();
@@ -635,8 +609,48 @@ impl Database for Postgres {
         "postgres-portal-256"
     }
     fn checkpoint(&mut self) -> Result<()> {
-        self.command("CHECKPOINT; SET max_parallel_workers_per_gather=0")
+        self.command("CHECKPOINT")
     }
+}
+
+#[cfg(feature = "competitive-postgres")]
+fn postgres_row(row: postgres::Row) -> Result<Row> {
+    use postgres::types::Type;
+    let mut values = Vec::with_capacity(row.len());
+    for (index, column) in row.columns().iter().enumerate() {
+        let value = match *column.type_() {
+            Type::INT8 => row
+                .try_get::<_, Option<i64>>(index)
+                .map(|v| v.map_or(Value::Null, |v| json!(v))),
+            Type::INT4 => row
+                .try_get::<_, Option<i32>>(index)
+                .map(|v| v.map_or(Value::Null, |v| json!(v))),
+            Type::INT2 => row
+                .try_get::<_, Option<i16>>(index)
+                .map(|v| v.map_or(Value::Null, |v| json!(v))),
+            Type::FLOAT8 => row
+                .try_get::<_, Option<f64>>(index)
+                .map(|v| v.map_or(Value::Null, |v| json!(v))),
+            Type::FLOAT4 => row
+                .try_get::<_, Option<f32>>(index)
+                .map(|v| v.map_or(Value::Null, |v| json!(v))),
+            Type::BOOL => row
+                .try_get::<_, Option<bool>>(index)
+                .map(|v| v.map_or(Value::Null, |v| json!(v))),
+            Type::TEXT | Type::VARCHAR | Type::BPCHAR => row
+                .try_get::<_, Option<String>>(index)
+                .map(|v| v.map_or(Value::Null, |v| json!(v))),
+            _ => {
+                return Err(format!(
+                    "adapter: unhandled PostgreSQL type {}",
+                    column.type_()
+                ))
+            }
+        }
+        .map_err(|e| e.to_string())?;
+        values.push(value);
+    }
+    Ok(values)
 }
 
 #[cfg(feature = "competitive-mysql")]
@@ -725,8 +739,12 @@ impl Database for Mysql {
             .0
             .query_first("SELECT @@sync_binlog")
             .map_err(|e| e.to_string())?;
+        let buffer_pool: Option<u64> = self
+            .0
+            .query_first("SELECT @@innodb_buffer_pool_size")
+            .map_err(|e| e.to_string())?;
         Ok(
-            json!({"version":version,"innodb_flush_log_at_trx_commit":flush,"sync_binlog":sync_binlog,"surface":"sql"}),
+            json!({"version":version,"innodb_flush_log_at_trx_commit":flush,"sync_binlog":sync_binlog,"innodb_buffer_pool_size":buffer_pool,"surface":"sql"}),
         )
     }
     fn producer(&self) -> &'static str {
