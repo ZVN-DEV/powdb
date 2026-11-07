@@ -5,8 +5,8 @@ When cutting a release, follow the checklist at the bottom.
 
 > **Next release: v0.29.2 (unreleased).** Bounded integer membership filters
 > avoid repeated row decoding, and inline scans reuse immutable decoding
-> metadata. Release review, fresh performance gates, and packaging preflights
-> must finish before publication. The install pins below remain on the verified
+> metadata. Fresh performance and packaging preflights pass; required final-head
+> CI, publication and live checks still gate release completion. The install pins below remain on the verified
 > published release until every channel passes live smoke checks.
 
 > **Current release: v0.29.1.** Faster eligible indexed membership reads,

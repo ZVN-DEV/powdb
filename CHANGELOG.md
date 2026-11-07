@@ -26,7 +26,7 @@ remain unchanged. The v0.29.0 transaction migration requirements still apply.
   behavior are preserved.
 
 Release validation and measurement scope are recorded in the
-[release preflight](docs/benchmarks/2026-11-06-v0.29.2-preflight.md).
+[release preflight](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-11-06-v0.29.2-preflight.md).
 
 ### Documentation
 
