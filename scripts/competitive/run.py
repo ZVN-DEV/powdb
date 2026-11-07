@@ -213,6 +213,15 @@ class Server:
                 # real command replaces the bootstrap shell before connecting.
                 command_name = Path(f"/proc/{state['Pid']}/comm").read_text().strip()
                 if command_name == ("postgres" if engine == "postgres" else "mysqld" if engine == "mysql" else "tini"):
+                    probe = (["pg_isready", "--host=/var/run/postgresql", "--username=bench", "--dbname=postgres"]
+                             if engine == "postgres" else
+                             ["mysqladmin", "--socket=/bench-socket/mysql.sock", "--user=root", "ping"]
+                             if engine == "mysql" else None)
+                    if probe and subprocess.run(["docker", "exec", self.container, *probe],
+                                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                                 timeout=5, check=False).returncode != 0:
+                        time.sleep(0.2)
+                        continue
                     self.pid = state["Pid"]
                     return
             time.sleep(0.2)

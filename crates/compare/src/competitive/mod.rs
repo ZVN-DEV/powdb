@@ -20,6 +20,9 @@ trait Database {
         "sql"
     }
     fn producer(&self) -> &'static str;
+    fn materialized_producer(&self) -> &'static str {
+        self.producer()
+    }
     fn checkpoint(&mut self) -> Result<()>;
     fn bound_points(&mut self, _ids: &[i64]) -> Result<Value> {
         Err("adapter: bound-point experiment is not implemented for this adapter".into())
@@ -137,7 +140,11 @@ fn measure(database: &mut dyn Database, request: Request) -> Value {
             }
         }
     }
-    json!({"samples":samples,"producer":database.producer()})
+    let producer = match request.delivery {
+        Delivery::Materialized => database.materialized_producer(),
+        Delivery::Consume => database.producer(),
+    };
+    json!({"samples":samples,"producer":producer})
 }
 
 fn fixture(database: &mut dyn Database, rows: usize) -> Result<()> {

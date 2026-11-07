@@ -68,7 +68,8 @@ sqlite,postgres,postgres-aa,mysql,powdb-server,powdb-server-sql`, six rounds and
 three image values from `engines.json` through `--postgres-image`, `--mysql-image`
 and `--powdb-image`. Docker access is required. Every server is a disposable,
 private container with networking disabled and a unique socket/data directory.
-The collector never attaches to a running database. Local test authentication is
+The collector never attaches to a running database. Socket existence is followed
+by an accepting-server probe for PostgreSQL/MySQL before opening fixture clients. Local test authentication is
 intentionally simple within this boundary; TLS/auth overhead is not measured.
 
 ## Fixture and measurement boundaries

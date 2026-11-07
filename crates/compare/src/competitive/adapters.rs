@@ -40,7 +40,7 @@ pub(super) fn open(engine: &str, directory: &Path, prepare: bool) -> Result<Box<
                 .dbname("postgres")
                 .options("-c max_parallel_workers_per_gather=0")
                 .connect(postgres::NoTls)
-                .map_err(|e| e.to_string())?;
+                .map_err(postgres_error)?;
             Ok(Box::new(Postgres(connection)))
         }
         #[cfg(feature = "competitive-mysql")]
@@ -528,6 +528,21 @@ fn duckdb_arrow_cell(array: &dyn duckdb::arrow::array::Array, row: usize) -> Res
 }
 
 #[cfg(feature = "competitive-postgres")]
+fn postgres_error(error: postgres::Error) -> String {
+    if let Some(db) = error.as_db_error() {
+        format!(
+            "PostgreSQL {}: {}; detail: {}; hint: {}",
+            db.code().code(),
+            db.message(),
+            db.detail().unwrap_or("none"),
+            db.hint().unwrap_or("none")
+        )
+    } else {
+        format!("PostgreSQL transport: {error:?}")
+    }
+}
+
+#[cfg(feature = "competitive-postgres")]
 struct Postgres(postgres::Client);
 
 #[cfg(feature = "competitive-postgres")]
@@ -536,7 +551,7 @@ impl Database for Postgres {
         let statement = self
             .0
             .prepare("SELECT id,name,amount FROM BenchRow WHERE id=$1")
-            .map_err(|e| e.to_string())?;
+            .map_err(postgres_error)?;
         let samples = ids
             .iter()
             .map(|id| {
@@ -544,11 +559,11 @@ impl Database for Postgres {
                     let row = self
                         .0
                         .query_one(&statement, &[id])
-                        .map_err(|e| e.to_string())?;
+                        .map_err(postgres_error)?;
                     Ok(vec![
-                        json!(row.try_get::<_, i64>(0).map_err(|e| e.to_string())?),
-                        json!(row.try_get::<_, String>(1).map_err(|e| e.to_string())?),
-                        json!(row.try_get::<_, i64>(2).map_err(|e| e.to_string())?),
+                        json!(row.try_get::<_, i64>(0).map_err(postgres_error)?),
+                        json!(row.try_get::<_, String>(1).map_err(postgres_error)?),
+                        json!(row.try_get::<_, i64>(2).map_err(postgres_error)?),
                     ])
                 })
             })
@@ -563,12 +578,12 @@ impl Database for Postgres {
     fn visit(&mut self, query: &str, visitor: &mut dyn FnMut(Row)) -> Result<()> {
         // A portal fetches bounded batches. The transaction is deliberate and
         // counted, including server-side blocking work before the first row.
-        let mut transaction = self.0.transaction().map_err(|e| e.to_string())?;
-        let portal = transaction.bind(query, &[]).map_err(|e| e.to_string())?;
+        let mut transaction = self.0.transaction().map_err(postgres_error)?;
+        let portal = transaction.bind(query, &[]).map_err(postgres_error)?;
         loop {
             let rows = transaction
                 .query_portal(&portal, 256)
-                .map_err(|e| e.to_string())?;
+                .map_err(postgres_error)?;
             if rows.is_empty() {
                 break;
             }
@@ -581,7 +596,7 @@ impl Database for Postgres {
     fn visit_materialized(&mut self, query: &str, visitor: &mut dyn FnMut(Row)) -> Result<()> {
         // Use the normal complete-result API for materialization. Explicit
         // portal/transaction round trips belong only to the consumption probe.
-        for row in self.0.query(query, &[]).map_err(|e| e.to_string())? {
+        for row in self.0.query(query, &[]).map_err(postgres_error)? {
             visitor(postgres_row(row)?);
         }
         Ok(())
@@ -600,13 +615,16 @@ impl Database for Postgres {
             let row = self
                 .0
                 .query_one(&format!("SHOW {name}"), &[])
-                .map_err(|e| e.to_string())?;
+                .map_err(postgres_error)?;
             settings.insert(name.into(), json!(row.get::<_, String>(0)));
         }
         Ok(Value::Object(settings))
     }
     fn producer(&self) -> &'static str {
         "postgres-portal-256"
+    }
+    fn materialized_producer(&self) -> &'static str {
+        "postgres-query-rows"
     }
     fn checkpoint(&mut self) -> Result<()> {
         self.command("CHECKPOINT")
@@ -647,7 +665,7 @@ fn postgres_row(row: postgres::Row) -> Result<Row> {
                 ))
             }
         }
-        .map_err(|e| e.to_string())?;
+        .map_err(postgres_error)?;
         values.push(value);
     }
     Ok(values)
