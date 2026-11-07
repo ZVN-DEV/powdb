@@ -1,6 +1,8 @@
-# Dependency security disposition — 2026-10-07
+# Dependency security disposition
 
-This record covers dependencies in v0.29.0, not the older v0.28.0 packages.
+The compatible-fixes section records the v0.29.0 production dependency refresh
+from 2026-10-07. The optional comparison-tool section records its 2026-11-06
+client migration after v0.29.2.
 Do not read a passing audit as a claim that
 every upstream informational advisory has disappeared.
 
