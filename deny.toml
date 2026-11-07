@@ -8,17 +8,12 @@
 # they stop matching rather than leaving them to accumulate.
 
 [advisories]
-# This list is intentionally NOT a copy of `.cargo/audit.toml`. The two tools
-# see different graphs: cargo-deny resolves features, so a dependency behind a
-# disabled optional feature is invisible to it, while cargo-audit scans
-# Cargo.lock and sees everything. `.cargo/audit.toml` therefore carries one ID
-# (RUSTSEC-2026-0235, rkyv via the powdb-compare `mysql` optional feature) that
-# must NOT be added here, because cargo-deny would report it as
-# `advisory-not-detected`.
+# cargo-audit scans the lockfile, while cargo-deny resolves enabled features.
+# Both suppression lists are currently empty after the optional MySQL refresh.
 #
 # The list is also short because cargo-deny's default `unmaintained =
 # "workspace"` only errors on unmaintained crates we depend on DIRECTLY.
-# Transitive unmaintained/unsound advisories (proc-macro-error2, lru, rand)
+# Transitive informational advisories
 # surface as non-failing `cargo audit` warnings and are left visible on purpose.
 #
 # Nothing here may be an actual vulnerability, and the list is currently EMPTY.

@@ -60,3 +60,7 @@ docs/design/*turbine*.md
 # a `git add -A` cannot publish the answer before it is made; delete this line
 # to publish.
 docs/design/2026-07-27-mvcc-design.md
+
+# Python benchmark tooling
+__pycache__/
+*.pyc
