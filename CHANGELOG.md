@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.2] - 2026-11-06
+
+This patch reduces repeated decoding and allocation in eligible read paths.
+The public APIs, wire and disk formats, default durability, and memory limits
+remain unchanged. The v0.29.0 transaction migration requirements still apply.
+
 ### Performance
 
 - Eligible unindexed integer-literal `IN` and `NOT IN` filters compile their
@@ -14,6 +20,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded; other types and unsupported shapes retain existing paths. Native
   paired and allocation gates cover both execution surfaces; this does not add
   SQL `IN` syntax or avoid visiting an unindexed query's input rows.
+- Inline table scans reuse the table's immutable row layout instead of
+  rebuilding variable-column metadata for every row. Complete metadata bounds
+  checks, legacy/v1 decoding outcomes, overflow handling, and schema refresh
+  behavior are preserved.
+
+Release validation and measurement scope are recorded in the
+[release preflight](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-11-06-v0.29.2-preflight.md).
+
+### Documentation
+
+- Link the landing page to native read gates and their query-shape limits.
+  Embedded examples keep Full durability by default, and transaction guidance
+  covers rollback after errors and uncertain commit outcomes.
+- Correct the README's WAL checkpoint guidance for the shipped binaries.
+
+### Release tooling
+
+- Build the macOS ARM addon on the current runner used by the binary release
+  workflow. GitHub rejects the former macOS 14 runner configuration before
+  executing any build step.
 
 ## [0.29.1] - 2026-11-04
 
@@ -4078,7 +4104,9 @@ Initial release of PowDB — a from-scratch database engine with PowQL query lan
      `TS client x.y.z` headings are npm releases with no git tag, so they
      have no compare link. -->
 
-[Unreleased]: https://github.com/ZVN-DEV/powdb/compare/v0.29.0...HEAD
+[Unreleased]: https://github.com/ZVN-DEV/powdb/compare/v0.29.2...HEAD
+[0.29.2]: https://github.com/ZVN-DEV/powdb/compare/v0.29.1...v0.29.2
+[0.29.1]: https://github.com/ZVN-DEV/powdb/compare/v0.29.0...v0.29.1
 [0.29.0]: https://github.com/ZVN-DEV/powdb/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/ZVN-DEV/powdb/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/ZVN-DEV/powdb/compare/v0.26.0...v0.27.0

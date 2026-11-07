@@ -76,7 +76,7 @@ powql></div>
     <div class="output">type User created</div>
 
     <p>No <code>CREATE TABLE</code>, no column types in parentheses. Fields have a name and a type, separated by a colon.</p>
-    <p>Supported types: <code>str</code>, <code>int</code>, <code>float</code>, <code>bool</code>, <code>datetime</code>, <code>uuid</code>, <code>bytes</code>.</p>
+    <p>Supported types: <code>str</code>, <code>int</code>, <code>float</code>, <code>bool</code>, <code>datetime</code>, <code>uuid</code>, <code>bytes</code>, <code>json</code>.</p>
 
     <!-- Step 4: Insert Data -->
     <h2><span class="step-number">4</span>Insert Data</h2>
@@ -249,7 +249,7 @@ powdb-cli --remote localhost:5433 --user alice --password s3cret</code></pre>
     <!-- What's Next -->
     <h2>What's Next</h2>
     <p>This tutorial covered tables, inserts, queries, aggregates, updates, indexes, deletes, and server mode. PowDB supports much more, including joins, group by, subqueries, materialized views, window functions, and set operations.</p>
-    <p>Embedding in Node instead of running a server? Install <code>@zvndev/powdb-embedded</code>, call <code>Database.open("./data")</code>, and run PowQL with <code>db.query(...)</code> or SQL with <code>db.querySql(...)</code> in-process — <code>db.setSyncMode("normal")</code> tunes write durability. See the <a href="index.html#embedded">Embedded in Node</a> overview.</p>
+    <p>Embedding in Node instead of running a server? Install <code>@zvndev/powdb-embedded</code>, call <code>Database.open("./data")</code>, and run PowQL with <code>db.query(...)</code> or SQL with <code>db.querySql(...)</code> in-process. Full durability is the default. Select <code>db.setSyncMode("normal")</code> only when your application accepts that an OS crash or power loss can lose recently acknowledged writes. See the <a href="index.html#embedded">Embedded in Node</a> overview.</p>
     <p>See the full language reference: <a href="powql.html">PowQL Reference</a></p>
   </div>
 </div>

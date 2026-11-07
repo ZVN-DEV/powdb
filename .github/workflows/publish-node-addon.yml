@@ -44,7 +44,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          # Use the same current ARM runner as release.yml. The old macos-14
+          # configuration is rejected before the build starts.
+          - os: macos-latest
             target: aarch64-apple-darwin
             rustflags: ""
           # Intel mac (x86_64-apple-darwin) is intentionally omitted: GitHub's

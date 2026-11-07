@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.29.2 - 2026-11-06
+
+No sync API or replication-format changes. The version and exact peer pins track
+the engine read-performance patch, wire client, and embedded addon.
+
 ## 0.29.1 - 2026-11-04
 
 No sync API or replication-format changes. The version and exact peer pins track

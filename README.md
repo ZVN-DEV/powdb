@@ -210,6 +210,15 @@ cargo install powdb-server
 
 ## Benchmark methodology: what to measure now
 
+Native read gates now cover [bounded unindexed integer membership](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/unindexed-membership.md)
+and [selective indexed membership plus streaming multiaggregates](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/query-recovery.md).
+They compare fixed PowDB revisions on the same machine, verify exact answers,
+and retain raw samples. These are scoped engine-local read measurements, with
+Full mode and the default memory allowance in the recovery fixtures. Unindexed
+membership still scans its input rows; the SQL frontend does not support SQL
+`IN` lists. See the [next patch preflight](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-11-06-v0.29.2-preflight.md)
+for release validation status.
+
 For measured implementation changes and raw paired results, see the
 [2026-10-01 write-bookkeeping profile](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-10-01-write-bookkeeping-profile.md).
 It separates WAL-Off engineering savings from Full-mode durability measurements.
@@ -265,7 +274,7 @@ The two weaker modes trade that guarantee away, and it is worth being exact abou
 - **`normal`** (`POWDB_SYNC_MODE=normal`, `WalSyncMode::Normal`) appends to the WAL but does not fsync before acknowledging. A **process** death loses nothing: the records are in the WAL, and replay finds them. Measured: 500 acknowledged inserts, `kill -9`, restart, all 500 present. What it exposes is an **OS crash or power loss**, which can lose whatever the kernel had not flushed. Writes are roughly 15-40x faster.
 - **`off`** (`POWDB_SYNC_MODE=off`, `WalSyncMode::Off`) writes no WAL at all, so there is nothing to replay and the loss window is not bounded by anything: **every row written since the last graceful close is gone** after any unclean exit. Measured on the same setup: 500 acknowledged inserts, `kill -9`, restart, `count` = 0. The table definition survived, the rows did not. The mode exists so the benchmark harness can compare against SQLite `:memory:`. Never point it at data you intend to keep.
 
-The embedded `Engine` checkpoints and truncates the WAL on its own once the durable log passes 64 MiB (`Catalog::set_wal_checkpoint_bytes`, `0` to opt out). `powdb-server` and `powdb-cli` do not: both install a WAL archive hook so retained replication history is never truncated behind a replica's back, and the automatic checkpoint never runs behind such a hook. For those two, only a graceful shutdown (SIGINT/SIGTERM) checkpoints and truncates, and during a run the log grows monotonically: 168 KB after 2,000 single-row inserts, back to 8 bytes once SIGTERM has been handled. Size the volume for the write burst between restarts, not for the size of the data.
+The embedded `Engine`, `powdb-server`, and `powdb-cli` automatically checkpoint once the durable WAL reaches 64 MiB, outside explicit transactions. Configure the threshold with `Catalog::set_wal_checkpoint_bytes` or the binaries' `--wal-checkpoint-bytes`; the server also accepts `POWDB_WAL_CHECKPOINT_BYTES`. A value of `0` opts out. An installed archive hook runs before the committed log is truncated. A database with an active embedded-sync identity retains its WAL for sync instead of taking this automatic checkpoint path. Graceful shutdown also checkpoints; allow enough disk space for the write burst and any retained sync history.
 
 ## PowQL
 

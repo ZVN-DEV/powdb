@@ -246,7 +246,30 @@ alter Post add index (.data->published_at)</code></pre>
 <section class="bench-section" id="benchmarks">
   <div class="container">
     <h2>Benchmarks</h2>
-    <p class="section-subtitle">PowDB's benchmark story is now a reproducible measurement path. Historical July 2026 results remain linked for context, but new public ratios wait for paired Full-mode evidence.</p>
+    <p class="section-subtitle">Measure the query shape you will run. Native read gates compare fixed PowDB revisions on the same machine, check exact answers, and retain raw samples. Cross-engine comparisons use a separate paired harness.</p>
+
+    <div class="compare-grid" style="margin-top: 24px;">
+      <div class="compare-card" style="padding: 24px;">
+        <div class="compare-card-header powql">Native read validation</div>
+        <h3>Bounded integer membership</h3>
+        <p>Eligible unindexed PowQL <code>IN</code> and <code>NOT IN</code> filters compile their key set once. The gate checks 100K and one-million-row fixtures on mutable and read-only engines with Full durability and the default memory allowance.</p>
+        <p><a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/unindexed-membership.md" target="_blank" rel="noopener">Query scope and reproduction</a></p>
+      </div>
+      <div class="compare-card" style="padding: 24px;">
+        <div class="compare-card-header powql">Read recovery</div>
+        <h3>Selective indexes and streaming aggregates</h3>
+        <p>Separate gates check eligible indexed membership and constant-group multiaggregate queries, including exact result IDs and reports that must fit the existing memory allowance.</p>
+        <p><a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/query-recovery.md" target="_blank" rel="noopener">Workloads, results and limits</a></p>
+      </div>
+    </div>
+    <p class="section-subtitle" style="margin-top: 24px;">These are engine-local read measurements. They do not establish competitor rankings or durable-write throughput. Unindexed membership still visits every input row, and the SQL frontend does not support SQL <code>IN</code> lists.</p>
+
+    <figure style="margin: 24px 0;">
+      <a href="assets/unindexed-membership.svg" aria-label="Open the full-size membership benchmark chart">
+        <img src="assets/unindexed-membership.svg" width="900" height="450" style="display: block; width: 100%; height: auto;" loading="lazy" alt="One-million-row membership medians: the frozen control takes 297 to 303 ms; the patch candidate takes 91 to 93 ms across mutable and read-only IN and NOT IN queries.">
+      </a>
+      <figcaption class="section-subtitle" style="margin-top: 12px;">November 6 release-candidate measurement: 3.23&ndash;3.31x speedup across these four one-million-row cases, with exact counts in every round. Same runner, five alternating pairs, Full mode. <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/unindexed-membership.md#release-validation" target="_blank" rel="noopener">Raw samples, provenance and release checks</a>.</figcaption>
+    </figure>
 
     <div class="compare-grid" style="margin-top: 24px;">
       <div class="compare-card" style="padding: 24px;">
@@ -384,9 +407,7 @@ match db.query("count(User)")? {
           <div class="compare-card-header powql">Node embedded</div>
           <pre><code class="language-typescript">import { Database } from "@zvndev/powdb-embedded";
 
-const db = Database.open("./data");
-
-db.setSyncMode("normal");
+const db = Database.open("./data"); // Full durability by default.
 
 db.query('type User { required name: str, required email: str, age: int }');
 db.query('insert User { name := "Alice", email := "alice@example.com", age := 30 }');
@@ -476,7 +497,7 @@ await client.close();</code></pre>
       </div>
       <div class="feature-card">
         <h3>Embedded in Node</h3>
-        <p>Native in-process addon (<code>@zvndev/powdb-embedded</code>): <code>Database.open</code>, then PowQL or SQL with no server. <code>setSyncMode("normal")</code> trades per-commit fsync for OS-level durability, which is what makes writes fast.</p>
+        <p>Native in-process addon (<code>@zvndev/powdb-embedded</code>): <code>Database.open</code>, then PowQL or SQL with no server. Full durability is the default. Selecting <code>setSyncMode("normal")</code> explicitly allows an OS crash or power loss to lose recently acknowledged writes.</p>
       </div>
       <div class="feature-card">
         <h3>TypeScript Client</h3>

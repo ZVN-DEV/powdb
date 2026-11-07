@@ -46,6 +46,15 @@ not add syntax or claim SQL membership acceleration. An unindexed query still
 visits its input rows. The improvement avoids repeated row decoding and
 allocation, not the scan itself.
 
+## Release validation
+
+The [November 6 release preflight](2026-11-06-v0.29.2-preflight.md) retains fresh
+100K/1M measurements, raw control/candidate samples, compiler and binary
+provenance, and the broader correctness and packaging checks. Ratios from
+earlier runs belong to their own hosts and builds; use the dated report when
+citing a result. Native read results do not establish competitor rankings or
+durable-write throughput.
+
 ## Reproduce
 
 Run the **unindexed membership recovery** workflow for retained paired samples,
