@@ -1,0 +1,30 @@
+{
+  "2026-11-06-competitive-reads-embedded-observations.json.gz": {
+    "archive_sha256": "9ae978ba8dc24403e81a126255637878393bec4469b635c9dde28ec0f53d081e",
+    "decoded_sha256": "4e9657483461961aea69f398ae53117f01c6e2c3a7810bfb96b7bf79d8f7d92c"
+  },
+  "2026-11-06-competitive-reads-embedded-scorecard.json": {
+    "archive_sha256": "110eb05bafb87d753dad05aa9cd86d9c385a9d7967777bb1935d28aa1db5eef1",
+    "decoded_sha256": "110eb05bafb87d753dad05aa9cd86d9c385a9d7967777bb1935d28aa1db5eef1"
+  },
+  "2026-11-06-competitive-reads-embedded-build-manifest.json": {
+    "archive_sha256": "c9a0a84c64cec64d130b391864051fbf631e8005e679bb5f92b8c8881f374d5c",
+    "decoded_sha256": "c9a0a84c64cec64d130b391864051fbf631e8005e679bb5f92b8c8881f374d5c"
+  },
+  "2026-11-06-competitive-reads-server-observations.json.gz": {
+    "archive_sha256": "fa18b3932d8f9f17cc05e015bf4a14c0547af2c6b7a789ec5cd02ab8f90d2edd",
+    "decoded_sha256": "cfc47027ad84e8b487394918de32c53640c6871b8025e86ba36e5ff3a3a63030"
+  },
+  "2026-11-06-competitive-reads-server-scorecard.json": {
+    "archive_sha256": "304174df02c282ec3de16723931e5be20901c421aa348fabcf12920c2fd05abd",
+    "decoded_sha256": "304174df02c282ec3de16723931e5be20901c421aa348fabcf12920c2fd05abd"
+  },
+  "2026-11-06-competitive-reads-server-build-manifest.json": {
+    "archive_sha256": "c9a0a84c64cec64d130b391864051fbf631e8005e679bb5f92b8c8881f374d5c",
+    "decoded_sha256": "c9a0a84c64cec64d130b391864051fbf631e8005e679bb5f92b8c8881f374d5c"
+  },
+  "2026-11-06-competitive-reads-server-server-smoke.json": {
+    "archive_sha256": "9b18a02174ca503d1c124e8d0f2af4e0fb55634717750497f4431feda1313d0f",
+    "decoded_sha256": "9b18a02174ca503d1c124e8d0f2af4e0fb55634717750497f4431feda1313d0f"
+  }
+}
