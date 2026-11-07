@@ -693,33 +693,12 @@ impl Database for Mysql {
             let row = row.map_err(|e| e.to_string())?;
             let mut values = Vec::with_capacity(row.len());
             for index in 0..row.len() {
-                values.push(
-                    match row.as_ref(index).ok_or("adapter: missing MySQL cell")? {
-                        mysql::Value::NULL => Value::Null,
-                        mysql::Value::Int(value) => json!(value),
-                        mysql::Value::UInt(value) => json!(value),
-                        mysql::Value::Float(value) if value.is_finite() => json!(value),
-                        mysql::Value::Double(value) if value.is_finite() => json!(value),
-                        mysql::Value::Bytes(value) => {
-                            let text = std::str::from_utf8(value).map_err(|e| e.to_string())?;
-                            use mysql::consts::ColumnType;
-                            match row.columns_ref()[index].column_type() {
-                                ColumnType::MYSQL_TYPE_NEWDECIMAL
-                                | ColumnType::MYSQL_TYPE_DECIMAL => {
-                                    if let Ok(integer) = text.parse::<i64>() {
-                                        json!(integer)
-                                    } else {
-                                        json!(text
-                                            .parse::<f64>()
-                                            .map_err(|e| format!("adapter: {e}"))?)
-                                    }
-                                }
-                                _ => json!(text),
-                            }
-                        }
-                        other => return Err(format!("adapter: unhandled MySQL result {other:?}")),
-                    },
-                );
+                let column = &row.columns_ref()[index];
+                values.push(mysql_cell(
+                    row.as_ref(index).ok_or("adapter: missing MySQL cell")?,
+                    column.column_type(),
+                    column.flags(),
+                )?);
             }
             visitor(values);
         }
@@ -752,5 +731,159 @@ impl Database for Mysql {
     }
     fn checkpoint(&mut self) -> Result<()> {
         self.command("FLUSH TABLES")
+    }
+}
+
+#[cfg(feature = "competitive-mysql")]
+fn mysql_cell(
+    value: &mysql::Value,
+    kind: mysql::consts::ColumnType,
+    flags: mysql::consts::ColumnFlags,
+) -> Result<Value> {
+    use mysql::consts::{ColumnFlags, ColumnType};
+    fn float(text: &str) -> Result<Value> {
+        let value = text
+            .parse::<f64>()
+            .map_err(|e| format!("adapter: MySQL numeric conversion: {e}"))?;
+        if !value.is_finite() {
+            return Err("adapter: non-finite MySQL numeric value".into());
+        }
+        Ok(json!(value))
+    }
+    fn integer(text: &str, unsigned: bool) -> Result<Value> {
+        if unsigned {
+            text.parse::<u64>()
+                .map(|v| json!(v))
+                .map_err(|e| format!("adapter: MySQL unsigned integer: {e}"))
+        } else {
+            text.parse::<i64>()
+                .map(|v| json!(v))
+                .map_err(|e| format!("adapter: MySQL signed integer: {e}"))
+        }
+    }
+    match value {
+        mysql::Value::NULL => Ok(Value::Null),
+        mysql::Value::Int(v) => Ok(json!(v)),
+        mysql::Value::UInt(v) => Ok(json!(v)),
+        mysql::Value::Float(v) if v.is_finite() => Ok(json!(v)),
+        mysql::Value::Double(v) if v.is_finite() => Ok(json!(v)),
+        mysql::Value::Bytes(bytes) => {
+            let text =
+                std::str::from_utf8(bytes).map_err(|e| format!("adapter: MySQL UTF-8: {e}"))?;
+            let unsigned = flags.contains(ColumnFlags::UNSIGNED_FLAG);
+            match kind {
+                ColumnType::MYSQL_TYPE_TINY
+                | ColumnType::MYSQL_TYPE_SHORT
+                | ColumnType::MYSQL_TYPE_LONG
+                | ColumnType::MYSQL_TYPE_LONGLONG
+                | ColumnType::MYSQL_TYPE_INT24
+                | ColumnType::MYSQL_TYPE_YEAR => integer(text, unsigned),
+                ColumnType::MYSQL_TYPE_FLOAT | ColumnType::MYSQL_TYPE_DOUBLE => float(text),
+                ColumnType::MYSQL_TYPE_NEWDECIMAL | ColumnType::MYSQL_TYPE_DECIMAL => {
+                    // SUM(BIGINT) is DECIMAL in MySQL's text protocol. Preserve
+                    // exact integral results; never route an overflowing int
+                    // through f64. This fixture's fractional decimal is AVG.
+                    if let Some((whole, fraction)) = text.split_once('.') {
+                        if fraction.bytes().all(|b| b == b'0') {
+                            integer(whole, unsigned)
+                        } else {
+                            float(text)
+                        }
+                    } else {
+                        integer(text, unsigned)
+                    }
+                }
+                _ => Ok(json!(text)),
+            }
+        }
+        other => Err(format!("adapter: unhandled MySQL result {other:?}")),
+    }
+}
+
+#[cfg(all(test, feature = "competitive-mysql"))]
+mod mysql_decoding_tests {
+    use super::*;
+    use mysql::consts::{ColumnFlags, ColumnType};
+    #[test]
+    fn text_and_binary_protocol_preserve_exact_integer_types() {
+        for value in [i64::MIN, -483, 17, 9_007_199_254_740_993, i64::MAX] {
+            let text = mysql::Value::Bytes(value.to_string().into_bytes());
+            assert_eq!(
+                mysql_cell(&text, ColumnType::MYSQL_TYPE_LONGLONG, ColumnFlags::empty()).unwrap(),
+                json!(value)
+            );
+            assert_eq!(
+                mysql_cell(
+                    &mysql::Value::Int(value),
+                    ColumnType::MYSQL_TYPE_LONGLONG,
+                    ColumnFlags::empty()
+                )
+                .unwrap(),
+                json!(value)
+            );
+        }
+        assert_eq!(
+            mysql_cell(
+                &mysql::Value::Bytes(u64::MAX.to_string().into_bytes()),
+                ColumnType::MYSQL_TYPE_LONGLONG,
+                ColumnFlags::UNSIGNED_FLAG
+            )
+            .unwrap(),
+            json!(u64::MAX)
+        );
+    }
+    #[test]
+    fn numeric_text_stays_text_and_null_stays_null() {
+        assert_eq!(
+            mysql_cell(
+                &mysql::Value::Bytes(b"0017".to_vec()),
+                ColumnType::MYSQL_TYPE_VAR_STRING,
+                ColumnFlags::empty()
+            )
+            .unwrap(),
+            json!("0017")
+        );
+        assert_eq!(
+            mysql_cell(
+                &mysql::Value::NULL,
+                ColumnType::MYSQL_TYPE_LONGLONG,
+                ColumnFlags::empty()
+            )
+            .unwrap(),
+            Value::Null
+        );
+    }
+    #[test]
+    fn decimal_integrals_do_not_lose_precision() {
+        assert_eq!(
+            mysql_cell(
+                &mysql::Value::Bytes(b"9007199254740993.0000".to_vec()),
+                ColumnType::MYSQL_TYPE_NEWDECIMAL,
+                ColumnFlags::empty()
+            )
+            .unwrap(),
+            json!(9_007_199_254_740_993_i64)
+        );
+        assert_eq!(
+            mysql_cell(
+                &mysql::Value::Bytes(b"-0.5000".to_vec()),
+                ColumnType::MYSQL_TYPE_NEWDECIMAL,
+                ColumnFlags::empty()
+            )
+            .unwrap(),
+            json!(-0.5)
+        );
+        assert!(mysql_cell(
+            &mysql::Value::Bytes(b"9223372036854775808".to_vec()),
+            ColumnType::MYSQL_TYPE_NEWDECIMAL,
+            ColumnFlags::empty()
+        )
+        .is_err());
+        assert!(mysql_cell(
+            &mysql::Value::Bytes(b"NaN".to_vec()),
+            ColumnType::MYSQL_TYPE_DOUBLE,
+            ColumnFlags::empty()
+        )
+        .is_err());
     }
 }

@@ -56,7 +56,10 @@ python3 scripts/competitive/score.py \
 A shared desktop run is diagnostic. `--isolated-host` is an explicit operator
 assertion, not a way to detect other tenants or certify hardware isolation.
 The manual `competitive` Actions workflow uses separate hosted jobs for the two
-cohorts. Builds and downloads finish before measurements. Workers and their
+cohorts. Builds and downloads finish before measurements. The server job first
+checks live fixture creation, server settings, text/binary numeric decoding,
+exact int64 values and ordered complete/consumed results against SQLite. A failed
+smoke prevents the full server collection and is retained with the artifacts. Workers and their
 owned server share one pinned CPU; the controller uses another physical core.
 Hosted VMs still have invisible host contention. Qualification can fail.
 

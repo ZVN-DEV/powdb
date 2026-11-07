@@ -40,6 +40,11 @@ jobs:
           for image in pins.values():
               subprocess.run(['docker','pull',image],check=True)
           PY
+      - name: Verify live server fixtures and typed result conversion
+        if: matrix.cohort == 'server'
+        env:
+          LD_LIBRARY_PATH: ${{ env.WORK }}/lib
+        run: python3 scripts/competitive/server_smoke.py --work "$WORK" --pins scripts/competitive/engines.json
       - name: Collect rotated rounds on an otherwise idle job
         env:
           LD_LIBRARY_PATH: ${{ env.WORK }}/lib

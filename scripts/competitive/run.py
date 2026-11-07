@@ -180,13 +180,14 @@ class Server:
                    "--user", f"{uid}:{gid}"]
         if cpu is not None:
             command += ["--cpuset-cpus", str(cpu)]
-        command += ["--mount", f"type=bind,src={socket_dir},dst=/bench-socket"]
+        socket_target = "/var/run/postgresql" if engine == "postgres" else "/bench-socket"
+        command += ["--mount", f"type=bind,src={socket_dir},dst={socket_target}"]
         if engine == "postgres":
             command += ["--mount", f"type=bind,src={data_dir},dst=/pgdata",
                         "--env", "PGDATA=/pgdata", "--env", "POSTGRES_USER=bench",
                         "--env", "POSTGRES_HOST_AUTH_METHOD=trust", image,
                         "postgres", "-c", "listen_addresses=", "-c",
-                        "unix_socket_directories=/bench-socket"]
+                        "unix_socket_directories=/var/run/postgresql"]
             socket_file = socket_dir / ".s.PGSQL.5432"
         elif engine == "mysql":
             command += ["--mount", f"type=bind,src={data_dir},dst=/var/lib/mysql",
