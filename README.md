@@ -210,6 +210,13 @@ cargo install powdb-server
 
 ## Benchmark methodology: what to measure now
 
+The [cross-engine relational-read baseline](docs/benchmarks/2026-11-06-competitive-reads.md)
+records typed query correctness, latency, delivery and sampled resident memory
+against SQLite, DuckDB, PostgreSQL and MySQL. It keeps PowQL/SQL and embedded/server
+cohorts separate. The initial 10K evidence retains noise and startup failures;
+aggregate rankings are withheld. See the [methodology](docs/benchmarks/competitive-baseline.md)
+and [capability/security evidence](docs/benchmarks/competitive-capabilities.md) for scope.
+
 Native read gates now cover [bounded unindexed integer membership](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/unindexed-membership.md)
 and [selective indexed membership plus streaming multiaggregates](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/query-recovery.md).
 They compare fixed PowDB revisions on the same machine, verify exact answers,

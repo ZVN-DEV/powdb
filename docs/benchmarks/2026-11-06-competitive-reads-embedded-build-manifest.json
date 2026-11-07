@@ -1,0 +1,17 @@
+{
+  "artifacts_sha256": {
+    "bin/sqlite": "0dc08fdaa3d4ece4e5502856783fcb937818ced7f6ef0831defedf8f2042fac1",
+    "bin/duckdb": "f1b855df4405892f2413137273c85f66628c0641937f9936343def1fdf7ed86b",
+    "bin/powdb": "53d15c4d19045217ffc7423b7d581485d47591af859445f2a430361ee878486f",
+    "bin/mysql": "0958ef317ebf73a2c6dfe35164c06c125da845cd77b40b36e83946d21523b890",
+    "bin/postgres": "48ab1c0dcccd7ff8eb34c570307b718aa3ea8bde291f3049e1f126c7f40adcad",
+    "bin/powdb-server": "43f38ec395452be588f6f1da6534702170b86d460e20e909d862498691060815",
+    "lib/libduckdb.so": "1f425596ada498cf1703d98768ba833d79254394c3581e5022b270ec7c2dee07",
+    "lib/libsqlite3.so": "4d98d5e17c4ab86d10a553e176878d7e4a5f56a69b745f2c0a0088cf89934d3c"
+  },
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)\nbinary: rustc\ncommit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\ncommit-date: 2026-10-13\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.1\nLLVM version: 23.1.1\n",
+  "cc": "cc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nCopyright (C) 2023 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+  "rustflags": "-C target-cpu=x86-64-v2",
+  "source_sha": "f4558611b4c172cd5112b1f6343f10130d038f61",
+  "sqlite_cc_flags": "-O3 -fPIC -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_RTREE -DSQLITE_ENABLE_COLUMN_METADATA"
+}
