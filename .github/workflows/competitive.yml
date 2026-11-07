@@ -20,7 +20,7 @@ jobs:
         cohort: [embedded, server]
     env:
       RUSTFLAGS: '-C target-cpu=x86-64-v2'
-      WORK: ${{ runner.temp }}/competitive
+      WORK: ${{ github.workspace }}/../competitive-work
       ROWS: ${{ inputs.rows }}
       COHORT: ${{ matrix.cohort }}
     steps:
@@ -41,7 +41,7 @@ jobs:
           PY
       - name: Collect rotated rounds on an otherwise idle job
         env:
-          LD_LIBRARY_PATH: ${{ runner.temp }}/competitive/lib
+          LD_LIBRARY_PATH: ${{ env.WORK }}/lib
         run: |
           python3 - <<'PY'
           import json,os,subprocess,sys
@@ -77,7 +77,7 @@ jobs:
         with:
           name: competitive-${{ matrix.cohort }}-${{ inputs.rows }}
           path: |
-            ${{ runner.temp }}/competitive/*.json
-            ${{ runner.temp }}/competitive/*-features.txt
-            ${{ runner.temp }}/competitive/*-linked-libraries.txt
+            ${{ env.WORK }}/*.json
+            ${{ env.WORK }}/*-features.txt
+            ${{ env.WORK }}/*-linked-libraries.txt
           if-no-files-found: error
