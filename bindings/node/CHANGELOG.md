@@ -4,8 +4,8 @@ Changes to `@zvndev/powdb-embedded`, the embedded PowDB native addon for Node.
 
 Releases before this file existed are recorded in the [repository
 CHANGELOG](https://github.com/ZVN-DEV/powdb/blob/main/CHANGELOG.md), which
-covers every PowDB crate and package in one place. The package version tracks
-the engine, so `@zvndev/powdb-embedded` 0.29.1 is PowDB 0.29.1.
+covers every PowDB crate and package in one place. The embedded package and
+engine versions move together.
 
 ## Unreleased
 
