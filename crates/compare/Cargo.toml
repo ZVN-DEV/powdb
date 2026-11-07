@@ -6,12 +6,16 @@ license.workspace = true
 publish = false
 
 [features]
-# MySQL is gated so isolated-worktree builds stay green even when the
-# `engines/mysql.rs` file is not yet present (MYSQL worker owns that file).
-# Enable with `--features mysql` once the file lands, or flip the default
-# once the MYSQL worker's branch has merged.
+# Optional comparison clients are excluded from production packages.
 default = []
 mysql = ["dep:mysql"]
+competitive = []
+competitive-powdb = ["competitive"]
+competitive-sqlite = ["competitive"]
+competitive-duckdb = ["competitive", "dep:duckdb"]
+competitive-postgres = ["competitive"]
+competitive-mysql = ["competitive", "mysql"]
+competitive-wire = ["competitive", "dep:powdb-server"]
 
 [dependencies]
 powdb-storage = { path = "../storage" }
@@ -19,8 +23,13 @@ powdb-query = { path = "../query" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 postgres = "0.19"
 tempfile = "3"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+blake3.workspace = true
+duckdb = { version = "=1.20000.1", optional = true, default-features = false }
+powdb-server = { path = "../server", optional = true }
 # Optional — only compiled in when the `mysql` feature is enabled.
-mysql = { version = "25", default-features = false, features = ["default-rustls"], optional = true }
+mysql = { version = "=28.0.4", default-features = false, features = ["default-rust", "rustls-tls"], optional = true }
 
 [[bin]]
 name = "compare-engines"
@@ -31,6 +40,11 @@ test = true
 name = "powdb-compare-paired"
 path = "src/paired.rs"
 test = true
+
+[[bin]]
+name = "powdb-competitive-worker"
+path = "src/competitive_worker.rs"
+required-features = ["competitive"]
 
 [lints]
 workspace = true

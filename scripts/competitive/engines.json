@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "reviewed_at": "2026-11-06",
+  "sqlite": {
+    "version": "3.54.1",
+    "url": "https://www.sqlite.org/2026/sqlite-amalgamation-3540100.zip",
+    "sha3_256": "92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30",
+    "source": "https://www.sqlite.org/download.html"
+  },
+  "duckdb": {
+    "version": "2.0.0",
+    "rust_client": "1.20000.1",
+    "url": "https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-shared-libs-linux-amd64.tar.gz",
+    "sha256": "993ad89e7dfca66cd6da994c2cad090c2fc160ddf9f550498a098ab4bb13cfb1",
+    "source": "https://github.com/duckdb/duckdb/releases/tag/v2.0.0"
+  },
+  "images": {
+    "postgres": "postgres:18.6-bookworm@sha256:f1ea2a1a4fb7b68d4836be1fdcb8a6466a89b072158bf9d97663600538c294c5",
+    "mysql": "mysql:8.4.13@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902",
+    "powdb": "ghcr.io/zvn-dev/powdb:v0.29.2@sha256:33cfec92377ceef1621e988244001416d4517f290331b843ae5b023f1a6db1f4"
+  }
+}

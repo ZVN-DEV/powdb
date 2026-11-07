@@ -1,6 +1,8 @@
-# Dependency security disposition — 2026-10-07
+# Dependency security disposition
 
-This record covers dependencies in v0.29.0, not the older v0.28.0 packages.
+The compatible-fixes section records the v0.29.0 production dependency refresh
+from 2026-10-07. The optional comparison-tool section records its 2026-11-06
+client migration after v0.29.2.
 Do not read a passing audit as a claim that
 every upstream informational advisory has disappeared.
 
@@ -17,42 +19,28 @@ every upstream informational advisory has disappeared.
 These fixes preserve the Rust 1.93 minimum. No new dependency or advisory
 suppression is introduced.
 
-## Remaining optional comparison-tool dependency
+## Optional comparison-tool refresh
 
-`lru` 0.12.5 remains reachable only through:
+The new cross-engine collector upgrades the unpublished optional comparison
+client to `mysql` 28.0.4, using `default-rust` and `rustls-tls`. Its resolved
+statement-cache dependency is `lru` 0.18.5, replacing 0.12.5 and removing the paths
+to [RUSTSEC-2026-0002](https://rustsec.org/advisories/RUSTSEC-2026-0002) and
+[RUSTSEC-2026-0253](https://rustsec.org/advisories/RUSTSEC-2026-0253).
 
-```text
-powdb-compare (publish = false, optional mysql feature, disabled by default)
-  -> mysql 25.0.1 -> lru 0.12.5
-```
+The refreshed graph no longer contains `rkyv`. The old optional-tool exception
+for RUSTSEC-2026-0235 has been removed from `.cargo/audit.toml`; both advisory
+suppression lists are empty. This is a dependency-path change, not a security
+audit or a claim that no advisory can affect the new graph. Production engine
+and published-package dependency selections are unchanged.
 
-It is absent from the default dependency graph and all eight published Rust
-crates, the server/CLI release binaries, and the embedded Node addon. This is a
-release-scope disposition, not a fix or a general safety guarantee for `lru`.
-The GitHub alerts and audit warnings remain visible; neither is dismissed or
-suppressed.
-
-- [RUSTSEC-2026-0002](https://rustsec.org/advisories/RUSTSEC-2026-0002): the
-  mutable iterator violates Stacked Borrows. The MySQL statement cache does not
-  use `iter_mut`.
-- [RUSTSEC-2026-0253](https://rustsec.org/advisories/RUSTSEC-2026-0253): `pop`
-  is not panic-safe when dropping a key panics. The MySQL statement cache's
-  key is `u32`, which has no panicking destructor. This does not excuse using
-  the affected library in other contexts.
-
-The follow-up is migration of the optional comparison tool to `mysql >= 28.0.3`
-with `lru >= 0.18.2`, including its changed TLS feature selection and a real
-MySQL comparison smoke. Upgrading only to `lru` 0.16.3 does not fix the newer
-panic-safety advisory. No such migration is claimed in this candidate.
-
-Recheck the scope on each dependency refresh:
+Verify the graph and the current advisory database:
 
 ```bash
 cargo tree --workspace --all-features --locked -i lru
-cargo tree --workspace --locked
+cargo tree --workspace --all-features --locked -i rkyv
 cargo audit
-npm audit --prefix bindings/node
 ```
 
-Other pre-existing unmaintained-dependency notices remain visible in audit
-output. The optional MySQL tool's existing `rkyv` exception is unchanged.
+The `rkyv` query is expected to report no matching package. The new client's
+build and live MySQL fixture must both pass before treating this migration as
+validated for server comparisons. Benchmark clients remain `publish = false`.

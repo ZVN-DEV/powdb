@@ -804,6 +804,9 @@ jobs:
       - name: Prove every comparator verdict is reachable
         run: bash scripts/ci/bench-gate-selftest.sh
 
+      - name: Prove competitive scores reject incorrect and unqualified observations
+        run: python3 -m unittest discover -s scripts/competitive -p 'test_*.py'
+
       - name: Prove paired evidence rejects unsafe conclusions
         run: bash scripts/paired-bench.sh --selftest
 
