@@ -3,13 +3,19 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
-> **Next release: v0.29.2 (unreleased).** Bounded integer membership filters
-> avoid repeated row decoding, and inline scans reuse immutable decoding
-> metadata. Fresh performance and packaging preflights pass; required final-head
-> CI, publication and live checks still gate release completion. The install pins below remain on the verified
-> published release until every channel passes live smoke checks.
+> **Current release: v0.29.2.** Bounded integer membership avoids repeated
+> decoding, and inline scans reuse immutable row metadata. Fresh unchanged
+> performance gates, required CI, fuzzing, patch API checks and all-platform
+> packaging preflights pass. All eight crates, three npm packages, prebuilt
+> binaries and the container are published; all six
+> [live-install checks pass](https://github.com/ZVN-DEV/powdb/actions/runs/42330149258).
+> See the [release preflight](docs/benchmarks/2026-11-06-v0.29.2-preflight.md)
+> for raw paired measurements and their query-shape limits. Public APIs,
+> wire/disk formats, default durability and memory limits are unchanged.
+> The v0.29.0 transaction migration requirements and WAL-Off write trade-offs
+> still apply.
 
-> **Current release: v0.29.1.** Faster eligible indexed membership reads,
+> **Previous release: v0.29.1.** Faster eligible indexed membership reads,
 > lower point-query and filtered-count overhead, and eligible multiaggregate
 > queries that complete within the existing memory allowance. Malformed index
 > counts are rejected before they can drive oversized allocations. Public APIs,
@@ -20,7 +26,7 @@ When cutting a release, follow the checklist at the bottom.
 > The v0.29.0 transaction migration requirements and disclosed WAL-Off write
 > trade-offs still apply; this read optimization does not claim to remove them.
 
-> **Previous release: v0.29.0.** Safer failed writes, offline integrity checks and
+> **Earlier release: v0.29.0.** Safer failed writes, offline integrity checks and
 > restore drills, and lower rollback-protection overhead. A failed statement in
 > an explicit transaction now requires `ROLLBACK`; uncertain commits must be
 > reconciled rather than blindly retried. Review the breaking migration notes in
