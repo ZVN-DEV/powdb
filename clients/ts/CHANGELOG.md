@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.29.2 - 2026-11-06
+
+No client API or wire-protocol changes. The version tracks the engine patch
+that reduces repeated decoding in eligible integer membership filters and
+inline scans. Upgrade the server to receive these engine improvements.
+
 ## 0.29.1 - 2026-11-04
 
 No client API or wire-protocol changes. The version tracks the engine patch,

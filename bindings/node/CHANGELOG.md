@@ -9,6 +9,15 @@ the engine, so `@zvndev/powdb-embedded` 0.29.1 is PowDB 0.29.1.
 
 ## Unreleased
 
+## 0.29.2 - 2026-11-06
+
+### Performance
+
+- Eligible unindexed integer membership filters compile their bounded key set
+  once, and inline scans reuse immutable decoding metadata. Query results,
+  JavaScript APIs, stored formats, memory limits and default durability are
+  unchanged. Unsupported shapes retain their existing execution paths.
+
 ## 0.29.1 - 2026-11-04
 
 ### Performance

@@ -3,6 +3,12 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
+> **Next release: v0.29.2 (unreleased).** Bounded integer membership filters
+> avoid repeated row decoding, and inline scans reuse immutable decoding
+> metadata. Release review, fresh performance gates, and packaging preflights
+> must finish before publication. The install pins below remain on the verified
+> published release until every channel passes live smoke checks.
+
 > **Current release: v0.29.1.** Faster eligible indexed membership reads,
 > lower point-query and filtered-count overhead, and eligible multiaggregate
 > queries that complete within the existing memory allowance. Malformed index

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.2] - 2026-11-06
+
+This patch reduces repeated decoding and allocation in eligible read paths.
+The public APIs, wire and disk formats, default durability, and memory limits
+remain unchanged. The v0.29.0 transaction migration requirements still apply.
+
 ### Performance
 
 - Eligible unindexed integer-literal `IN` and `NOT IN` filters compile their
@@ -14,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded; other types and unsupported shapes retain existing paths. Native
   paired and allocation gates cover both execution surfaces; this does not add
   SQL `IN` syntax or avoid visiting an unindexed query's input rows.
+- Inline table scans reuse the table's immutable row layout instead of
+  rebuilding variable-column metadata for every row. Complete metadata bounds
+  checks, legacy/v1 decoding outcomes, overflow handling, and schema refresh
+  behavior are preserved.
+
+Release validation and measurement scope are recorded in the
+[release preflight](docs/benchmarks/2026-11-06-v0.29.2-preflight.md).
 
 ## [0.29.1] - 2026-11-04
 
