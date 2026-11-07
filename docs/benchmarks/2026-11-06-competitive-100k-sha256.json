@@ -1,0 +1,30 @@
+{
+  "2026-11-06-competitive-100k-embedded-observations.json.gz": {
+    "archive_sha256": "b3ce3490a9d768108e1570e842f8897b4fc92efb3f78ac89eb0660bc353f40e8",
+    "decoded_sha256": "5390f48f2c0f244d8e6670de3f3fde172693c31bdc87adbc43d7aef0f0536f04"
+  },
+  "2026-11-06-competitive-100k-embedded-scorecard.json": {
+    "archive_sha256": "e0dd9e4020c177c4f5df3403df8b91b406ffa737a5649731db4e5c9b87f55950",
+    "decoded_sha256": "e0dd9e4020c177c4f5df3403df8b91b406ffa737a5649731db4e5c9b87f55950"
+  },
+  "2026-11-06-competitive-100k-embedded-build-manifest.json": {
+    "archive_sha256": "03d75048308ece9734dd81ec89657b54fb771bd07230113e78baf6292d051556",
+    "decoded_sha256": "03d75048308ece9734dd81ec89657b54fb771bd07230113e78baf6292d051556"
+  },
+  "2026-11-06-competitive-100k-server-observations.json.gz": {
+    "archive_sha256": "1f20270210a82c095ee3b8ae85082ffb6fdf608231e70c2612dbf78f1b12a287",
+    "decoded_sha256": "cd29f913f85515a3fb69117e8368bd8ba94e02304f28aec9e0860652f343c253"
+  },
+  "2026-11-06-competitive-100k-server-scorecard.json": {
+    "archive_sha256": "a06921368c38f622030286199c4355fb6335180ff5882efa155baf7816ec7f1a",
+    "decoded_sha256": "a06921368c38f622030286199c4355fb6335180ff5882efa155baf7816ec7f1a"
+  },
+  "2026-11-06-competitive-100k-server-build-manifest.json": {
+    "archive_sha256": "03d75048308ece9734dd81ec89657b54fb771bd07230113e78baf6292d051556",
+    "decoded_sha256": "03d75048308ece9734dd81ec89657b54fb771bd07230113e78baf6292d051556"
+  },
+  "2026-11-06-competitive-100k-server-server-smoke.json": {
+    "archive_sha256": "9b18a02174ca503d1c124e8d0f2af4e0fb55634717750497f4431feda1313d0f",
+    "decoded_sha256": "9b18a02174ca503d1c124e8d0f2af4e0fb55634717750497f4431feda1313d0f"
+  }
+}

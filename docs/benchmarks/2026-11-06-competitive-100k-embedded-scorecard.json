@@ -1,0 +1,4654 @@
+{
+  "schema": 1,
+  "profile": "relational-reads-v1",
+  "qualification_reasons": [],
+  "cells": [
+    {
+      "engine": "duckdb",
+      "case": "point_bound",
+      "category": "point_bound",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 428524.0,
+      "round_medians_ns": [
+        428323.0,
+        428524.0,
+        428614.0,
+        427136.0,
+        434593.5
+      ],
+      "relative_round_spread": 0.017402759238689083,
+      "per_request_samples": 5000,
+      "p95_ns": 462045,
+      "p99_ns": 497442,
+      "median_first_row_ns": 428524.0,
+      "sampled_peak_pss_kib": 85419,
+      "producer": "materialized-prepared-point"
+    },
+    {
+      "engine": "duckdb",
+      "case": "point_indexed",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 856726.0,
+      "round_medians_ns": [
+        856726.0,
+        867682.0,
+        856271.0,
+        853980.0,
+        859740.0
+      ],
+      "relative_round_spread": 0.015993444811993565,
+      "per_request_samples": 5000,
+      "p95_ns": 895098,
+      "p99_ns": 931855,
+      "median_first_row_ns": 856726.0,
+      "sampled_peak_pss_kib": 82143,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "point_missing",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 749806.0,
+      "round_medians_ns": [
+        744340.5,
+        749806.0,
+        750222.0,
+        749609.5,
+        750631.0
+      ],
+      "relative_round_spread": 0.008389503418217512,
+      "per_request_samples": 5000,
+      "p95_ns": 785573,
+      "p99_ns": 814366,
+      "median_first_row_ns": null,
+      "sampled_peak_pss_kib": 54407,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "point_unindexed",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 2177383.5,
+      "round_medians_ns": [
+        2665216.5,
+        2670784.5,
+        2177383.5,
+        2098976.0,
+        2023279.0
+      ],
+      "relative_round_spread": 0.2973777931172896,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2177383.5,
+      "sampled_peak_pss_kib": 54518,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "range_page",
+      "category": "range",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 1944642.0,
+      "round_medians_ns": [
+        2002810.5,
+        1944642.0,
+        1951730.5,
+        1937543.5,
+        1924856.0
+      ],
+      "relative_round_spread": 0.04008681289409567,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1944642.0,
+      "sampled_peak_pss_kib": 58155,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "filtered_count",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 1041560.5,
+      "round_medians_ns": [
+        1042695.0,
+        1045025.5,
+        1039509.5,
+        1041560.5,
+        1036316.0
+      ],
+      "relative_round_spread": 0.008361972252211946,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1041560.5,
+      "sampled_peak_pss_kib": 58155,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "and_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 1632266.0,
+      "round_medians_ns": [
+        1851340.5,
+        1835057.0,
+        1632266.0,
+        1624026.5,
+        1612616.0
+      ],
+      "relative_round_spread": 0.14625342928174698,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1632266.0,
+      "sampled_peak_pss_kib": 58171,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "or_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 3565356.5,
+      "round_medians_ns": [
+        3674594.0,
+        3815887.5,
+        3565356.5,
+        3531278.5,
+        3373584.5
+      ],
+      "relative_round_spread": 0.12405575711713542,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 3565356.5,
+      "sampled_peak_pss_kib": 58483,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "indexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 1583140.5,
+      "round_medians_ns": [
+        1580208.0,
+        1561449.0,
+        1590067.0,
+        1645782.5,
+        1583140.5
+      ],
+      "relative_round_spread": 0.05326975085281439,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1583140.5,
+      "sampled_peak_pss_kib": 58215,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "unindexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 1677084.5,
+      "round_medians_ns": [
+        1677084.5,
+        1718138.0,
+        1690520.5,
+        1663315.0,
+        1667148.5
+      ],
+      "relative_round_spread": 0.03268946794273037,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1677084.5,
+      "sampled_peak_pss_kib": 58303,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "unindexed_not_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 1235607.0,
+      "round_medians_ns": [
+        1223193.5,
+        1275302.0,
+        1235607.0,
+        1243333.5,
+        1224569.0
+      ],
+      "relative_round_spread": 0.04217238976470674,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1235607.0,
+      "sampled_peak_pss_kib": 58114,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "null_count",
+      "category": "nulls",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 891286.5,
+      "round_medians_ns": [
+        891205.5,
+        929984.5,
+        891286.5,
+        889515.5,
+        891790.0
+      ],
+      "relative_round_spread": 0.04540515311294404,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 891286.5,
+      "sampled_peak_pss_kib": 58114,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "sort_top100",
+      "category": "sorting",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 1881123.0,
+      "round_medians_ns": [
+        1898133.5,
+        1881123.0,
+        1893681.0,
+        1869907.5,
+        1874941.5
+      ],
+      "relative_round_spread": 0.015004866773730374,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1881123.0,
+      "sampled_peak_pss_kib": 58370,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "pagination_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 7446956.5,
+      "round_medians_ns": [
+        7932887.0,
+        7424701.0,
+        7486615.0,
+        7425927.5,
+        7446956.5
+      ],
+      "relative_round_spread": 0.06824076386104846,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 7446956.5,
+      "sampled_peak_pss_kib": 60082,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "pagination_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 2702928.5,
+      "round_medians_ns": [
+        2750386.5,
+        2708895.5,
+        2702928.5,
+        2697122.0,
+        2687257.5
+      ],
+      "relative_round_spread": 0.023355778741465043,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2702928.5,
+      "sampled_peak_pss_kib": 60094,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "pagination_pk_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 2756329.0,
+      "round_medians_ns": [
+        2852037.0,
+        2747578.5,
+        2756329.0,
+        2764277.0,
+        2742030.0
+      ],
+      "relative_round_spread": 0.03991069280916756,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2756329.0,
+      "sampled_peak_pss_kib": 62578,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "pagination_pk_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 1231700.5,
+      "round_medians_ns": [
+        1249923.5,
+        1231700.5,
+        1240045.5,
+        1219584.0,
+        1229292.5
+      ],
+      "relative_round_spread": 0.024632205637652983,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1231700.5,
+      "sampled_peak_pss_kib": 62282,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "sum",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 852333.0,
+      "round_medians_ns": [
+        844257.5,
+        852333.0,
+        870176.5,
+        855061.5,
+        845428.5
+      ],
+      "relative_round_spread": 0.030409476108516274,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 852333.0,
+      "sampled_peak_pss_kib": 61599,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "avg",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 993641.0,
+      "round_medians_ns": [
+        973109.0,
+        1021189.5,
+        976211.0,
+        993641.0,
+        995695.0
+      ],
+      "relative_round_spread": 0.04838820056740815,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 993641.0,
+      "sampled_peak_pss_kib": 61498,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 2362910.5,
+      "round_medians_ns": [
+        2328039.5,
+        2362910.5,
+        2297733.5,
+        2449462.5,
+        2437464.5
+      ],
+      "relative_round_spread": 0.06421275795253353,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2362910.5,
+      "sampled_peak_pss_kib": 61799,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "distinct",
+      "category": "set",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 1585639.5,
+      "round_medians_ns": [
+        1609693.0,
+        1621445.5,
+        1584541.5,
+        1582504.0,
+        1585639.5
+      ],
+      "relative_round_spread": 0.024558860951685423,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1585639.5,
+      "sampled_peak_pss_kib": 63147,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "join_projection",
+      "category": "join",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 2234996.5,
+      "round_medians_ns": [
+        2287449.0,
+        2252393.5,
+        2234996.5,
+        2212229.0,
+        2225177.5
+      ],
+      "relative_round_spread": 0.033655533688755214,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2234996.5,
+      "sampled_peak_pss_kib": 62723,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "compound_join",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 2413361.0,
+      "round_medians_ns": [
+        2469064.0,
+        2442960.5,
+        2413361.0,
+        2399158.5,
+        2392305.5
+      ],
+      "relative_round_spread": 0.0318056436645823,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2413361.0,
+      "sampled_peak_pss_kib": 61427,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "join_group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 3229456.0,
+      "round_medians_ns": [
+        3270481.5,
+        3267497.0,
+        3229456.0,
+        3184650.0,
+        3191205.5
+      ],
+      "relative_round_spread": 0.02657769605778806,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 3229456.0,
+      "sampled_peak_pss_kib": 61559,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "exists_correlated",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 2194194.5,
+      "round_medians_ns": [
+        2217572.0,
+        2188909.5,
+        2222563.0,
+        2194194.5,
+        2176511.0
+      ],
+      "relative_round_spread": 0.020988112038381284,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2194194.5,
+      "sampled_peak_pss_kib": 61907,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "in_subquery",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 1983554.5,
+      "round_medians_ns": [
+        1999819.5,
+        1983554.5,
+        1965200.0,
+        1959670.0,
+        1996684.0
+      ],
+      "relative_round_spread": 0.02024118823052253,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1983554.5,
+      "sampled_peak_pss_kib": 61503,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "case_expression",
+      "category": "expression",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 1284013.0,
+      "round_medians_ns": [
+        1296761.0,
+        1284013.0,
+        1273227.5,
+        1296333.0,
+        1274647.0
+      ],
+      "relative_round_spread": 0.018328085463309173,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1284013.0,
+      "sampled_peak_pss_kib": 61755,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "int64_exact",
+      "category": "types",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 752391.0,
+      "round_medians_ns": [
+        752391.0,
+        754174.5,
+        746299.5,
+        753942.5,
+        746343.0
+      ],
+      "relative_round_spread": 0.01046663237598536,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 752391.0,
+      "sampled_peak_pss_kib": 61511,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "window_rank",
+      "category": "window",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 2613965.5,
+      "round_medians_ns": [
+        2613965.5,
+        2569418.5,
+        2830222.5,
+        2615839.5,
+        2538954.5
+      ],
+      "relative_round_spread": 0.11142763743438848,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2613965.5,
+      "sampled_peak_pss_kib": 63335,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 18060610,
+      "round_medians_ns": [
+        18084374,
+        18110188,
+        18060610,
+        16895895,
+        16947256
+      ],
+      "relative_round_spread": 0.06723432929452548,
+      "per_request_samples": 15,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 18060610,
+      "sampled_peak_pss_kib": 74403,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 15445265,
+      "round_medians_ns": [
+        15792508,
+        15949717,
+        15445265,
+        15165324,
+        15274643
+      ],
+      "relative_round_spread": 0.05078533777180255,
+      "per_request_samples": 15,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 3327309,
+      "sampled_peak_pss_kib": 58639,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 36720605,
+      "round_medians_ns": [
+        34998585,
+        36720605,
+        37233997,
+        34412194,
+        37069526
+      ],
+      "relative_round_spread": 0.07684522082356758,
+      "per_request_samples": 15,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 36720605,
+      "sampled_peak_pss_kib": 118391,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "duckdb",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 63610936,
+      "round_medians_ns": [
+        63610936,
+        63440618,
+        63914922,
+        63469497,
+        63966335
+      ],
+      "relative_round_spread": 0.008264569475915274,
+      "per_request_samples": 15,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 8739046,
+      "sampled_peak_pss_kib": 85224,
+      "producer": "duckdb-arrow-chunk-stream"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "point_bound",
+      "category": "point_bound",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 5981.0,
+      "round_medians_ns": [
+        5911.0,
+        5991.0,
+        6443.0,
+        5981.0,
+        5971.0
+      ],
+      "relative_round_spread": 0.08894833639859555,
+      "per_request_samples": 5000,
+      "p95_ns": 7694,
+      "p99_ns": 9678,
+      "median_first_row_ns": 5981.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "materialized-prepared-point"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "point_indexed",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 7434.0,
+      "round_medians_ns": [
+        7449.5,
+        7193.0,
+        8004.5,
+        7434.0,
+        7404.0
+      ],
+      "relative_round_spread": 0.10916061339790153,
+      "per_request_samples": 5000,
+      "p95_ns": 9568,
+      "p99_ns": 14106,
+      "median_first_row_ns": 7434.0,
+      "sampled_peak_pss_kib": 91284,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "point_missing",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 2485.0,
+      "round_medians_ns": [
+        2485.0,
+        2444.0,
+        2495.0,
+        2605.0,
+        2485.0
+      ],
+      "relative_round_spread": 0.0647887323943662,
+      "per_request_samples": 5000,
+      "p95_ns": 3457,
+      "p99_ns": 4609,
+      "median_first_row_ns": null,
+      "sampled_peak_pss_kib": null,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "point_unindexed",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 3622439.0,
+      "round_medians_ns": [
+        3992408.5,
+        3481727.0,
+        3568567.5,
+        3753339.0,
+        3622439.0
+      ],
+      "relative_round_spread": 0.1409772531711369,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 3622439.0,
+      "sampled_peak_pss_kib": 37149,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "range_page",
+      "category": "range",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 160488946.0,
+      "round_medians_ns": [
+        159520907.5,
+        162559167.5,
+        159905924.0,
+        160488946.0,
+        160872621.5
+      ],
+      "relative_round_spread": 0.018931272687154416,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 160488946.0,
+      "sampled_peak_pss_kib": 64711,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "filtered_count",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 3015380.0,
+      "round_medians_ns": [
+        3345150.0,
+        3229130.5,
+        3015380.0,
+        2976866.0,
+        2932469.5
+      ],
+      "relative_round_spread": 0.13685853855898758,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 3015380.0,
+      "sampled_peak_pss_kib": 79571,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "and_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 3755473.0,
+      "round_medians_ns": [
+        3991442.0,
+        3875935.5,
+        3755473.0,
+        3723224.0,
+        3567148.5
+      ],
+      "relative_round_spread": 0.11298004272697473,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 3755473.0,
+      "sampled_peak_pss_kib": 79571,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "or_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 20223968.5,
+      "round_medians_ns": [
+        20809891.0,
+        20317245.0,
+        20223968.5,
+        20221196.5,
+        20143871.0
+      ],
+      "relative_round_spread": 0.03293221110386915,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 20223968.5,
+      "sampled_peak_pss_kib": 79571,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "indexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 1060765.0,
+      "round_medians_ns": [
+        1110095.5,
+        1060765.0,
+        1044588.5,
+        1061193.0,
+        1054881.5
+      ],
+      "relative_round_spread": 0.061754488505936754,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 1060765.0,
+      "sampled_peak_pss_kib": 58583,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "unindexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 3912969.0,
+      "round_medians_ns": [
+        3912969.0,
+        3979955.0,
+        3984296.0,
+        3726375.5,
+        3652022.5
+      ],
+      "relative_round_spread": 0.08491595512256805,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 3912969.0,
+      "sampled_peak_pss_kib": 79631,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "unindexed_not_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 3829873.5,
+      "round_medians_ns": [
+        3829873.5,
+        3903857.5,
+        3886483.0,
+        3269041.5,
+        3470016.5
+      ],
+      "relative_round_spread": 0.16575377750727277,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 3829873.5,
+      "sampled_peak_pss_kib": 79631,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "null_count",
+      "category": "nulls",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 3127636.0,
+      "round_medians_ns": [
+        3468491.5,
+        3127636.0,
+        4353173.0,
+        2689984.5,
+        2709120.5
+      ],
+      "relative_round_spread": 0.5317717598851017,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 3127636.0,
+      "sampled_peak_pss_kib": 79631,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "sort_top100",
+      "category": "sorting",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 42490336.0,
+      "round_medians_ns": [
+        46229516.0,
+        46562197.5,
+        40516816.5,
+        41355202.0,
+        42490336.0
+      ],
+      "relative_round_spread": 0.14227661085099444,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 42490336.0,
+      "sampled_peak_pss_kib": 79631,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "pagination_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 140823143.5,
+      "round_medians_ns": [
+        143577059.0,
+        147423318.5,
+        134995742.0,
+        131707480.0,
+        140823143.5
+      ],
+      "relative_round_spread": 0.11159982733946001,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 140823143.5,
+      "sampled_peak_pss_kib": 63092,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "pagination_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 36625032.5,
+      "round_medians_ns": [
+        36949898.5,
+        37834001.0,
+        35578292.5,
+        36625032.5,
+        35422764.0
+      ],
+      "relative_round_spread": 0.0658357641047827,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 36625032.5,
+      "sampled_peak_pss_kib": 83667,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "pagination_pk_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 79289080.5,
+      "round_medians_ns": [
+        80790488.0,
+        79289080.5,
+        77034495.5,
+        78635694.0,
+        79360906.5
+      ],
+      "relative_round_spread": 0.0473708671649938,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 79289080.5,
+      "sampled_peak_pss_kib": 63060,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "pagination_pk_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 63470800.0,
+      "round_medians_ns": [
+        63463384.5,
+        63470800.0,
+        62821970.5,
+        63930592.0,
+        64191956.0
+      ],
+      "relative_round_spread": 0.02158450027414181,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 63470800.0,
+      "sampled_peak_pss_kib": 63024,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "sum",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 2951754.5,
+      "round_medians_ns": [
+        3050818.5,
+        3258584.5,
+        2710534.5,
+        2951754.5,
+        2871285.5
+      ],
+      "relative_round_spread": 0.1856692350261514,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2951754.5,
+      "sampled_peak_pss_kib": 84200,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "avg",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 3002372.5,
+      "round_medians_ns": [
+        3002372.5,
+        3185999.0,
+        2819629.0,
+        3048059.5,
+        2743156.0
+      ],
+      "relative_round_spread": 0.1474976872456699,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 3002372.5,
+      "sampled_peak_pss_kib": 84200,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 89051757.0,
+      "round_medians_ns": [
+        90209031.5,
+        90464885.5,
+        88675201.5,
+        87759207.0,
+        89051757.0
+      ],
+      "relative_round_spread": 0.030383212989273194,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 89051757.0,
+      "sampled_peak_pss_kib": 63152,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "distinct",
+      "category": "set",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 118406718.5,
+      "round_medians_ns": [
+        126003207.0,
+        118406718.5,
+        118959541.0,
+        117038304.5,
+        118123415.5
+      ],
+      "relative_round_spread": 0.07571278567271501,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 118406718.5,
+      "sampled_peak_pss_kib": 68397,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "join_projection",
+      "category": "join",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 131701327.0,
+      "round_medians_ns": [
+        135896594.0,
+        131701327.0,
+        128412096.0,
+        133188201.0,
+        129014230.0
+      ],
+      "relative_round_spread": 0.056829328682466505,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 131701327.0,
+      "sampled_peak_pss_kib": 116764,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "compound_join",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 133664107.5,
+      "round_medians_ns": [
+        133664107.5,
+        135738651.5,
+        132704359.5,
+        134047999.5,
+        129598693.0
+      ],
+      "relative_round_spread": 0.04593573110118586,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 133664107.5,
+      "sampled_peak_pss_kib": 107608,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "join_group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 172864564.0,
+      "round_medians_ns": [
+        181897950.0,
+        180773549.5,
+        172864564.0,
+        172602075.5,
+        169454177.5
+      ],
+      "relative_round_spread": 0.07198567602322475,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 172864564.0,
+      "sampled_peak_pss_kib": 131616,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "exists_correlated",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 755146867.5,
+      "round_medians_ns": [
+        749428595.5,
+        757005227.0,
+        769778569.0,
+        747457791.0,
+        755146867.5
+      ],
+      "relative_round_spread": 0.029558194519028445,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 755146867.5,
+      "sampled_peak_pss_kib": 73673,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "in_subquery",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 6171320.5,
+      "round_medians_ns": [
+        6345976.5,
+        6146404.5,
+        6216737.0,
+        6041875.0,
+        6171320.5
+      ],
+      "relative_round_spread": 0.04927656892880543,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 6171320.5,
+      "sampled_peak_pss_kib": 94721,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "case_expression",
+      "category": "expression",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 344030.0,
+      "round_medians_ns": [
+        344471.0,
+        343974.5,
+        338539.0,
+        345991.5,
+        344030.0
+      ],
+      "relative_round_spread": 0.021662355027177862,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 344030.0,
+      "sampled_peak_pss_kib": 73673,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "int64_exact",
+      "category": "types",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 6362.0,
+      "round_medians_ns": [
+        7839.0,
+        6281.0,
+        6522.0,
+        6362.0,
+        6332.0
+      ],
+      "relative_round_spread": 0.24489154353976736,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 6362.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "window_rank",
+      "category": "window",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 361140.0,
+      "round_medians_ns": [
+        360766.5,
+        362760.5,
+        361067.0,
+        361140.0,
+        363006.0
+      ],
+      "relative_round_spread": 0.006201196211995348,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 361140.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 103412575,
+      "round_medians_ns": [
+        106659845,
+        105641167,
+        102249416,
+        102216646,
+        103412575
+      ],
+      "relative_round_spread": 0.04296575150555917,
+      "per_request_samples": 15,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 103412575,
+      "sampled_peak_pss_kib": 70853,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 111457253,
+      "round_medians_ns": [
+        113718588,
+        113459396,
+        111457253,
+        110980804,
+        109352237
+      ],
+      "relative_round_spread": 0.03917511765699088,
+      "per_request_samples": 15,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 98701273,
+      "sampled_peak_pss_kib": 70834,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 96763812,
+      "round_medians_ns": [
+        96419326,
+        96763812,
+        97877569,
+        97345074,
+        95083859
+      ],
+      "relative_round_spread": 0.02887143387860743,
+      "per_request_samples": 15,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 96763812,
+      "sampled_peak_pss_kib": 91192,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-powql",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 141760027,
+      "round_medians_ns": [
+        141760027,
+        145306298,
+        141102824,
+        140977367,
+        146854003
+      ],
+      "relative_round_spread": 0.04145481716083477,
+      "per_request_samples": 15,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 89434823,
+      "sampled_peak_pss_kib": 91212,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "point_bound",
+      "category": "point_bound",
+      "delivery": "materialized",
+      "status": "rejected",
+      "reasons": [
+        "unsupported: SQL frontend has no parameterized prepare API"
+      ]
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "point_indexed",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 12708.5,
+      "round_medians_ns": [
+        12303.0,
+        12444.0,
+        12708.5,
+        12794.0,
+        12784.0
+      ],
+      "relative_round_spread": 0.03863555887791636,
+      "per_request_samples": 5000,
+      "p95_ns": 15128,
+      "p99_ns": 26299,
+      "median_first_row_ns": 12708.5,
+      "sampled_peak_pss_kib": 91329,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "point_missing",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 6251.0,
+      "round_medians_ns": [
+        6251.0,
+        6302.0,
+        7334.0,
+        6172.0,
+        6182.0
+      ],
+      "relative_round_spread": 0.1858902575587906,
+      "per_request_samples": 5000,
+      "p95_ns": 8205,
+      "p99_ns": 12754,
+      "median_first_row_ns": null,
+      "sampled_peak_pss_kib": null,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "point_unindexed",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 3871978.0,
+      "round_medians_ns": [
+        3871978.0,
+        3971572.5,
+        3762926.0,
+        3626827.5,
+        4082093.5
+      ],
+      "relative_round_spread": 0.11757969699208001,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 3871978.0,
+      "sampled_peak_pss_kib": 37158,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "range_page",
+      "category": "range",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 162590340.5,
+      "round_medians_ns": [
+        174173887.5,
+        181702681.5,
+        162590340.5,
+        157968706.5,
+        160807727.0
+      ],
+      "relative_round_spread": 0.14597407771588988,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 162590340.5,
+      "sampled_peak_pss_kib": 64505,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "filtered_count",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 2996814.5,
+      "round_medians_ns": [
+        2847458.0,
+        3213941.0,
+        3372263.5,
+        2883113.0,
+        2996814.5
+      ],
+      "relative_round_spread": 0.17512111610511763,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2996814.5,
+      "sampled_peak_pss_kib": 66478,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "and_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 3617568.0,
+      "round_medians_ns": [
+        3542551.0,
+        3810760.0,
+        3647751.0,
+        3617568.0,
+        3585627.5
+      ],
+      "relative_round_spread": 0.07414069341612929,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 3617568.0,
+      "sampled_peak_pss_kib": 66478,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "or_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 20433277.0,
+      "round_medians_ns": [
+        20184768.0,
+        20981154.0,
+        20840057.5,
+        19907426.0,
+        20433277.0
+      ],
+      "relative_round_spread": 0.05254800784034788,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 20433277.0,
+      "sampled_peak_pss_kib": 66478,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "indexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "rejected",
+      "reasons": [
+        "SQL IN lists/subqueries are not supported yet in the SQL frontend"
+      ]
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "unindexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "rejected",
+      "reasons": [
+        "SQL IN lists/subqueries are not supported yet in the SQL frontend"
+      ]
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "unindexed_not_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "rejected",
+      "reasons": [
+        "SQL IN lists/subqueries are not supported yet in the SQL frontend"
+      ]
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "null_count",
+      "category": "nulls",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 2777087.0,
+      "round_medians_ns": [
+        3018213.0,
+        3339526.5,
+        2747407.5,
+        2777087.0,
+        2714037.5
+      ],
+      "relative_round_spread": 0.22523205070636965,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 2777087.0,
+      "sampled_peak_pss_kib": 66478,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "sort_top100",
+      "category": "sorting",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 46139943.0,
+      "round_medians_ns": [
+        55904697.5,
+        58996889.5,
+        46139943.0,
+        42610094.0,
+        42667831.0
+      ],
+      "relative_round_spread": 0.3551542207150104,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 46139943.0,
+      "sampled_peak_pss_kib": 66478,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "pagination_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 134409877.0,
+      "round_medians_ns": [
+        129482560.0,
+        143616972.5,
+        142752740.0,
+        130962463.5,
+        134409877.0
+      ],
+      "relative_round_spread": 0.10515903157920456,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 134409877.0,
+      "sampled_peak_pss_kib": 62954,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "pagination_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 36364462.0,
+      "round_medians_ns": [
+        35776798.0,
+        38002414.5,
+        36212374.5,
+        36364462.0,
+        37372751.5
+      ],
+      "relative_round_spread": 0.06120306413442883,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 36364462.0,
+      "sampled_peak_pss_kib": 70273,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "pagination_pk_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 78879302.5,
+      "round_medians_ns": [
+        81627746.5,
+        79175491.5,
+        78807478.5,
+        77537923.0,
+        78879302.5
+      ],
+      "relative_round_spread": 0.051849133681170674,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 78879302.5,
+      "sampled_peak_pss_kib": 63042,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "pagination_pk_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 63737030.0,
+      "round_medians_ns": [
+        63737030.0,
+        63957173.0,
+        63610414.5,
+        62797850.0,
+        64087606.0
+      ],
+      "relative_round_spread": 0.020235583615992148,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 63737030.0,
+      "sampled_peak_pss_kib": 62954,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "sum",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 3206100.0,
+      "round_medians_ns": [
+        3206100.0,
+        3199048.5,
+        3214813.5,
+        3266290.5,
+        3005714.0
+      ],
+      "relative_round_spread": 0.08127522535167338,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 3206100.0,
+      "sampled_peak_pss_kib": 84130,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "avg",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 3097296.5,
+      "round_medians_ns": [
+        3097296.5,
+        3375712.0,
+        3190053.0,
+        2926549.5,
+        3012492.0
+      ],
+      "relative_round_spread": 0.1450175984120345,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 3097296.5,
+      "sampled_peak_pss_kib": 84130,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 85438418.5,
+      "round_medians_ns": [
+        85045015.0,
+        86447176.5,
+        86095222.5,
+        84957512.5,
+        85438418.5
+      ],
+      "relative_round_spread": 0.017435528725288845,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 85438418.5,
+      "sampled_peak_pss_kib": 63082,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "distinct",
+      "category": "set",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 118958781.5,
+      "round_medians_ns": [
+        119641610.5,
+        123736508.0,
+        118958781.5,
+        117794984.0,
+        118171645.0
+      ],
+      "relative_round_spread": 0.049946073127858995,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 118958781.5,
+      "sampled_peak_pss_kib": 68330,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "join_projection",
+      "category": "join",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 130030296.5,
+      "round_medians_ns": [
+        130142026.0,
+        129759436.0,
+        131277438.5,
+        126891059.0,
+        130030296.5
+      ],
+      "relative_round_spread": 0.0337335191725876,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 130030296.5,
+      "sampled_peak_pss_kib": 116749,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "compound_join",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 130747903.0,
+      "round_medians_ns": [
+        130610740.0,
+        131050401.5,
+        132470645.5,
+        129022465.5,
+        130747903.0
+      ],
+      "relative_round_spread": 0.026372736547828228,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 130747903.0,
+      "sampled_peak_pss_kib": 107617,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "join_group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 140232267.0,
+      "round_medians_ns": [
+        142791249.5,
+        139303070.5,
+        140232267.0,
+        137951641.5,
+        140548227.0
+      ],
+      "relative_round_spread": 0.034511372478917425,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 140232267.0,
+      "sampled_peak_pss_kib": 116753,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "exists_correlated",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "rejected",
+      "reasons": [
+        "SQL EXISTS subqueries are not supported yet; use PowQL EXISTS for now"
+      ]
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "in_subquery",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "rejected",
+      "reasons": [
+        "SQL IN lists/subqueries are not supported yet in the SQL frontend"
+      ]
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "case_expression",
+      "category": "expression",
+      "delivery": "materialized",
+      "status": "rejected",
+      "reasons": [
+        "SQL CASE/WHEN is not supported yet in the SQL frontend; PowQL has it: case when <cond> then <value> else <value> end"
+      ]
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "int64_exact",
+      "category": "types",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 10239.0,
+      "round_medians_ns": [
+        10144.0,
+        13009.5,
+        10239.0,
+        10174.0,
+        10319.5
+      ],
+      "relative_round_spread": 0.2798613145815021,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 10239.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "window_rank",
+      "category": "window",
+      "delivery": "materialized",
+      "status": "rejected",
+      "reasons": [
+        "SQL window functions (OVER) are not supported yet in the SQL frontend; PowQL has them: row_number() over (order .col)"
+      ]
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 103488811,
+      "round_medians_ns": [
+        103800444,
+        110849960,
+        102101624,
+        103410318,
+        103488811
+      ],
+      "relative_round_spread": 0.08453412417696055,
+      "per_request_samples": 15,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 103488811,
+      "sampled_peak_pss_kib": 71010,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 110860018,
+      "round_medians_ns": [
+        110860018,
+        112240648,
+        112890040,
+        108853333,
+        110150126
+      ],
+      "relative_round_spread": 0.036412649689448906,
+      "per_request_samples": 15,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 98031909,
+      "sampled_peak_pss_kib": 71040,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 99615014,
+      "round_medians_ns": [
+        100061033,
+        99615014,
+        96484870,
+        101280794,
+        96176976
+      ],
+      "relative_round_spread": 0.05123542922957377,
+      "per_request_samples": 15,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 99615014,
+      "sampled_peak_pss_kib": 91324,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "powdb-sql",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 141685847,
+      "round_medians_ns": [
+        145394791,
+        140519742,
+        142241413,
+        141685847,
+        141465897
+      ],
+      "relative_round_spread": 0.034407452143049966,
+      "per_request_samples": 15,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 89657516,
+      "sampled_peak_pss_kib": 91325,
+      "producer": "materialized-engine-result"
+    },
+    {
+      "engine": "sqlite",
+      "case": "point_bound",
+      "category": "point_bound",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 4689.0,
+      "round_medians_ns": [
+        4899.5,
+        4649.0,
+        4709.0,
+        4649.0,
+        4689.0
+      ],
+      "relative_round_spread": 0.053422904670505436,
+      "per_request_samples": 5000,
+      "p95_ns": 6583,
+      "p99_ns": 9828,
+      "median_first_row_ns": 4689.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "materialized-prepared-point"
+    },
+    {
+      "engine": "sqlite",
+      "case": "point_indexed",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 7084.0,
+      "round_medians_ns": [
+        6963.0,
+        7398.5,
+        7084.0,
+        7053.0,
+        7093.5
+      ],
+      "relative_round_spread": 0.06147656691134952,
+      "per_request_samples": 5000,
+      "p95_ns": 9137,
+      "p99_ns": 14116,
+      "median_first_row_ns": 7084.0,
+      "sampled_peak_pss_kib": 6767,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "point_missing",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 4769.0,
+      "round_medians_ns": [
+        4769.0,
+        4739.0,
+        4760.0,
+        4769.0,
+        4799.0
+      ],
+      "relative_round_spread": 0.012581253931641853,
+      "per_request_samples": 5000,
+      "p95_ns": 4970,
+      "p99_ns": 8676,
+      "median_first_row_ns": null,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "point_unindexed",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 8540214.5,
+      "round_medians_ns": [
+        8690139.0,
+        8776021.0,
+        8251900.0,
+        8381017.5,
+        8540214.5
+      ],
+      "relative_round_spread": 0.06137094097577994,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 8540214.5,
+      "sampled_peak_pss_kib": 4763,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "range_page",
+      "category": "range",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 12659.0,
+      "round_medians_ns": [
+        11902.5,
+        12443.5,
+        12659.0,
+        12899.0,
+        16801.5
+      ],
+      "relative_round_spread": 0.3869973931590173,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 12659.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "filtered_count",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 7315359.0,
+      "round_medians_ns": [
+        7360080.5,
+        7315359.0,
+        7211961.0,
+        7482199.0,
+        7208926.0
+      ],
+      "relative_round_spread": 0.03735606140450523,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 7315359.0,
+      "sampled_peak_pss_kib": 4646,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "and_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 232947.0,
+      "round_medians_ns": [
+        232947.0,
+        244423.5,
+        230848.0,
+        248110.5,
+        232095.0
+      ],
+      "relative_round_spread": 0.07410483929820946,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 232947.0,
+      "sampled_peak_pss_kib": 4666,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "or_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 205309.5,
+      "round_medians_ns": [
+        205309.5,
+        207564.0,
+        199995.5,
+        213615.0,
+        202399.0
+      ],
+      "relative_round_spread": 0.06633643353084002,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 205309.5,
+      "sampled_peak_pss_kib": 4674,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "indexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 62532.5,
+      "round_medians_ns": [
+        61340.0,
+        60499.0,
+        62532.5,
+        63584.0,
+        63283.5
+      ],
+      "relative_round_spread": 0.049334346140007194,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 62532.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "unindexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 9153644.0,
+      "round_medians_ns": [
+        9018349.5,
+        9179324.0,
+        9268202.5,
+        8858546.5,
+        9153644.0
+      ],
+      "relative_round_spread": 0.044753324468375655,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 9153644.0,
+      "sampled_peak_pss_kib": 4750,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "unindexed_not_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 13015911.0,
+      "round_medians_ns": [
+        13015911.0,
+        13283361.0,
+        12723663.0,
+        12875581.5,
+        13130061.0
+      ],
+      "relative_round_spread": 0.04300106231519254,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 13015911.0,
+      "sampled_peak_pss_kib": 4750,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "null_count",
+      "category": "nulls",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 7454060.5,
+      "round_medians_ns": [
+        7420023.0,
+        7827253.5,
+        7444887.5,
+        7709577.0,
+        7454060.5
+      ],
+      "relative_round_spread": 0.054632035787742804,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 7454060.5,
+      "sampled_peak_pss_kib": 4750,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "sort_top100",
+      "category": "sorting",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 8881198.5,
+      "round_medians_ns": [
+        8817993.0,
+        8904629.0,
+        8740007.5,
+        8881198.5,
+        8896687.0
+      ],
+      "relative_round_spread": 0.018535955479432195,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 8881198.5,
+      "sampled_peak_pss_kib": 4750,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "pagination_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 57687440.5,
+      "round_medians_ns": [
+        57687440.5,
+        58193841.0,
+        57454611.0,
+        56970739.0,
+        58319824.5
+      ],
+      "relative_round_spread": 0.023386121629022524,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 57687440.5,
+      "sampled_peak_pss_kib": 6014,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "pagination_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 8841476.0,
+      "round_medians_ns": [
+        9037028.0,
+        8841476.0,
+        8734450.0,
+        8837429.5,
+        9042319.5
+      ],
+      "relative_round_spread": 0.03482105250299837,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 8841476.0,
+      "sampled_peak_pss_kib": 5205,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "pagination_pk_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 3741752.0,
+      "round_medians_ns": [
+        3695722.0,
+        3752702.5,
+        3741752.0,
+        3657295.5,
+        3792249.0
+      ],
+      "relative_round_spread": 0.036066928005918084,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 3741752.0,
+      "sampled_peak_pss_kib": 4938,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "pagination_pk_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 20478.5,
+      "round_medians_ns": [
+        20478.5,
+        20559.5,
+        20133.0,
+        20253.0,
+        20924.0
+      ],
+      "relative_round_spread": 0.038625875918646385,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 20478.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "sum",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 7640342.5,
+      "round_medians_ns": [
+        7676854.0,
+        7501200.5,
+        7375231.0,
+        7780985.5,
+        7640342.5
+      ],
+      "relative_round_spread": 0.053106846977082504,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 7640342.5,
+      "sampled_peak_pss_kib": 4938,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "avg",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 7721345.0,
+      "round_medians_ns": [
+        7549485.0,
+        7943405.0,
+        7540231.0,
+        7858466.0,
+        7721345.0
+      ],
+      "relative_round_spread": 0.05221551426597309,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 7721345.0,
+      "sampled_peak_pss_kib": 4931,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 34903638.5,
+      "round_medians_ns": [
+        35192462.0,
+        34915477.0,
+        34681450.5,
+        34903638.5,
+        34743892.0
+      ],
+      "relative_round_spread": 0.014640636963965805,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 34903638.5,
+      "sampled_peak_pss_kib": 7183,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "distinct",
+      "category": "set",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 29894188.0,
+      "round_medians_ns": [
+        30096611.0,
+        30128486.0,
+        29894188.0,
+        29755595.0,
+        29764358.5
+      ],
+      "relative_round_spread": 0.012473695555805029,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 29894188.0,
+      "sampled_peak_pss_kib": 7183,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "join_projection",
+      "category": "join",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 442694.5,
+      "round_medians_ns": [
+        442694.5,
+        446933.0,
+        438948.0,
+        440860.5,
+        443610.5
+      ],
+      "relative_round_spread": 0.018037269493973836,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 442694.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "compound_join",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 51877.0,
+      "round_medians_ns": [
+        55564.0,
+        51536.5,
+        52403.5,
+        51441.0,
+        51877.0
+      ],
+      "relative_round_spread": 0.07947645391984888,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 51877.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "join_group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 40064496.5,
+      "round_medians_ns": [
+        39927532.5,
+        41343134.5,
+        39990413.0,
+        40155806.5,
+        40064496.5
+      ],
+      "relative_round_spread": 0.03533307850255899,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 40064496.5,
+      "sampled_peak_pss_kib": 7891,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "exists_correlated",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 126497.0,
+      "round_medians_ns": [
+        129583.0,
+        127820.0,
+        124638.0,
+        126497.0,
+        124739.0
+      ],
+      "relative_round_spread": 0.03909183617002775,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 126497.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "in_subquery",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 141701.0,
+      "round_medians_ns": [
+        143624.0,
+        138315.0,
+        141701.0,
+        141730.5,
+        140402.5
+      ],
+      "relative_round_spread": 0.037466214070472334,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 141701.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "case_expression",
+      "category": "expression",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 25002.5,
+      "round_medians_ns": [
+        26229.0,
+        25002.5,
+        23629.5,
+        23343.5,
+        25092.0
+      ],
+      "relative_round_spread": 0.1154084591540846,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 25002.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "int64_exact",
+      "category": "types",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 4779.0,
+      "round_medians_ns": [
+        4809.0,
+        4703.5,
+        4779.0,
+        4849.0,
+        4754.0
+      ],
+      "relative_round_spread": 0.03044569993722536,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 4779.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "window_rank",
+      "category": "window",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 95945.0,
+      "round_medians_ns": [
+        99867.0,
+        95945.0,
+        94657.0,
+        99211.0,
+        95740.0
+      ],
+      "relative_round_spread": 0.05430194382198134,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 95945.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 16261741,
+      "round_medians_ns": [
+        16261741,
+        16900932,
+        16098235,
+        16247838,
+        16720635
+      ],
+      "relative_round_spread": 0.0493610739465104,
+      "per_request_samples": 15,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 16261741,
+      "sampled_peak_pss_kib": 14710,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 23943625,
+      "round_medians_ns": [
+        23928510,
+        24008640,
+        23939438,
+        23943625,
+        24518277
+      ],
+      "relative_round_spread": 0.024631483328025727,
+      "per_request_samples": 15,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 19456,
+      "sampled_peak_pss_kib": 4494,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 28971518,
+      "round_medians_ns": [
+        29057474,
+        28693396,
+        29041083,
+        28765157,
+        28971518
+      ],
+      "relative_round_spread": 0.01256675608092058,
+      "per_request_samples": 15,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 28971518,
+      "sampled_peak_pss_kib": 35602,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 70661671,
+      "round_medians_ns": [
+        70760199,
+        70493487,
+        74732867,
+        70370880,
+        70661671
+      ],
+      "relative_round_spread": 0.061730595077492574,
+      "per_request_samples": 15,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 42109,
+      "sampled_peak_pss_kib": 4486,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "point_bound",
+      "category": "point_bound",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 4639.0,
+      "round_medians_ns": [
+        4629.0,
+        4678.5,
+        4629.0,
+        4658.0,
+        4639.0
+      ],
+      "relative_round_spread": 0.010670403104117267,
+      "per_request_samples": 5000,
+      "p95_ns": 6492,
+      "p99_ns": 9408,
+      "median_first_row_ns": 4639.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "materialized-prepared-point"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "point_indexed",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 7063.0,
+      "round_medians_ns": [
+        6863.0,
+        7594.0,
+        7063.0,
+        7013.0,
+        7123.0
+      ],
+      "relative_round_spread": 0.10349709755061588,
+      "per_request_samples": 5000,
+      "p95_ns": 9628,
+      "p99_ns": 15990,
+      "median_first_row_ns": 7063.0,
+      "sampled_peak_pss_kib": 6726,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "point_missing",
+      "category": "point",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 4759.0,
+      "round_medians_ns": [
+        4588.0,
+        4829.0,
+        4739.0,
+        4759.0,
+        4798.0
+      ],
+      "relative_round_spread": 0.05064089094347552,
+      "per_request_samples": 5000,
+      "p95_ns": 4990,
+      "p99_ns": 8937,
+      "median_first_row_ns": null,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "point_unindexed",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 8448784.0,
+      "round_medians_ns": [
+        8280931.5,
+        8711827.5,
+        8620225.0,
+        8448784.0,
+        8257126.0
+      ],
+      "relative_round_spread": 0.05381857318165549,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 8448784.0,
+      "sampled_peak_pss_kib": 4707,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "range_page",
+      "category": "range",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 12894.0,
+      "round_medians_ns": [
+        12463.5,
+        12689.0,
+        12894.0,
+        13135.0,
+        17137.0
+      ],
+      "relative_round_spread": 0.3624554056150147,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 12894.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "filtered_count",
+      "category": "scan",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 7061384.0,
+      "round_medians_ns": [
+        6932684.0,
+        7499966.0,
+        7037460.5,
+        7061384.0,
+        7364241.5
+      ],
+      "relative_round_spread": 0.08033580952402532,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 7061384.0,
+      "sampled_peak_pss_kib": 4774,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "and_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 233001.5,
+      "round_medians_ns": [
+        234714.5,
+        233001.5,
+        231522.5,
+        234314.0,
+        230992.5
+      ],
+      "relative_round_spread": 0.015974146089188266,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 233001.5,
+      "sampled_peak_pss_kib": 4790,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "or_projection",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 201137.0,
+      "round_medians_ns": [
+        201337.0,
+        204022.0,
+        199424.0,
+        199098.0,
+        201137.0
+      ],
+      "relative_round_spread": 0.024480826501339883,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 201137.0,
+      "sampled_peak_pss_kib": 4798,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "indexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 62917.5,
+      "round_medians_ns": [
+        71283.0,
+        60508.0,
+        61169.5,
+        62917.5,
+        63289.0
+      ],
+      "relative_round_spread": 0.1712560098541741,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 62917.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "unindexed_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 9122235.5,
+      "round_medians_ns": [
+        14174487.5,
+        9363784.5,
+        8984253.0,
+        9122235.5,
+        8915488.0
+      ],
+      "relative_round_spread": 0.5765033691577026,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 9122235.5,
+      "sampled_peak_pss_kib": 4878,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "unindexed_not_in",
+      "category": "membership",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 13236445.0,
+      "round_medians_ns": [
+        22053926.5,
+        13236445.0,
+        12912124.0,
+        13032216.5,
+        13250449.5
+      ],
+      "relative_round_spread": 0.6906539104721849,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 13236445.0,
+      "sampled_peak_pss_kib": 4878,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "null_count",
+      "category": "nulls",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 7472970.5,
+      "round_medians_ns": [
+        7369097.0,
+        7578907.0,
+        7469798.5,
+        7472970.5,
+        7924157.5
+      ],
+      "relative_round_spread": 0.07427575152344038,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 7472970.5,
+      "sampled_peak_pss_kib": 4878,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "sort_top100",
+      "category": "sorting",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 8884784.5,
+      "round_medians_ns": [
+        16952259.5,
+        8884784.5,
+        8771754.5,
+        9027934.5,
+        8803870.5
+      ],
+      "relative_round_spread": 0.9207319547255198,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 8884784.5,
+      "sampled_peak_pss_kib": 4878,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "pagination_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 58310766.5,
+      "round_medians_ns": [
+        63157975.0,
+        57712700.0,
+        58912159.0,
+        58310766.5,
+        57291291.5
+      ],
+      "relative_round_spread": 0.10061063937480567,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 58310766.5,
+      "sampled_peak_pss_kib": 6134,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "pagination_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 9028166.5,
+      "round_medians_ns": [
+        16778393.0,
+        9060605.0,
+        9028166.5,
+        8728528.5,
+        8827620.5
+      ],
+      "relative_round_spread": 0.8916389058620042,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 9028166.5,
+      "sampled_peak_pss_kib": 4918,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "pagination_pk_offset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 3702522.5,
+      "round_medians_ns": [
+        3820160.5,
+        3667822.5,
+        3925847.0,
+        3637585.0,
+        3702522.5
+      ],
+      "relative_round_spread": 0.07785557008769022,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 3702522.5,
+      "sampled_peak_pss_kib": 4918,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "pagination_pk_keyset",
+      "category": "pagination",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 20473.5,
+      "round_medians_ns": [
+        20789.0,
+        20739.5,
+        19977.0,
+        20473.5,
+        20148.0
+      ],
+      "relative_round_spread": 0.03966102522773341,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 20473.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "sum",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 7863927.5,
+      "round_medians_ns": [
+        7886157.0,
+        7494323.0,
+        7863927.5,
+        7896173.5,
+        7607745.0
+      ],
+      "relative_round_spread": 0.05110048382312782,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 7863927.5,
+      "sampled_peak_pss_kib": 4918,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "avg",
+      "category": "aggregate",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 7580643.0,
+      "round_medians_ns": [
+        7923181.0,
+        7540103.5,
+        7563002.5,
+        7580643.0,
+        7676182.0
+      ],
+      "relative_round_spread": 0.05053364206703838,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 7580643.0,
+      "sampled_peak_pss_kib": 4918,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 35118763.0,
+      "round_medians_ns": [
+        40077630.0,
+        34726577.5,
+        34875041.0,
+        35118763.0,
+        35127278.0
+      ],
+      "relative_round_spread": 0.15237018741235275,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 35118763.0,
+      "sampled_peak_pss_kib": 7171,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "distinct",
+      "category": "set",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 29785666.5,
+      "round_medians_ns": [
+        32908908.5,
+        29686077.0,
+        29785666.5,
+        29775952.5,
+        29857801.0
+      ],
+      "relative_round_spread": 0.10820075152590593,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 29785666.5,
+      "sampled_peak_pss_kib": 7171,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "join_projection",
+      "category": "join",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 443261.5,
+      "round_medians_ns": [
+        587055.0,
+        443261.5,
+        443380.0,
+        440490.0,
+        440866.0
+      ],
+      "relative_round_spread": 0.33065131981911355,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 443261.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "compound_join",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 51241.0,
+      "round_medians_ns": [
+        64791.5,
+        55705.0,
+        51151.5,
+        51241.0,
+        51085.5
+      ],
+      "relative_round_spread": 0.2674811186354677,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 51241.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "join_group_having",
+      "category": "combined",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 40184010.0,
+      "round_medians_ns": [
+        45390148.0,
+        40184010.0,
+        40360793.0,
+        40026973.5,
+        40041670.5
+      ],
+      "relative_round_spread": 0.13346538834725555,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 40184010.0,
+      "sampled_peak_pss_kib": 7891,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "exists_correlated",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [
+        "round spread exceeds 20%"
+      ],
+      "median_ns": 131095.5,
+      "round_medians_ns": [
+        132984.5,
+        131095.5,
+        213525.0,
+        128591.0,
+        127569.5
+      ],
+      "relative_round_spread": 0.6556708658954732,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 131095.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "in_subquery",
+      "category": "subquery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 141976.0,
+      "round_medians_ns": [
+        153422.5,
+        141976.0,
+        144861.5,
+        138053.5,
+        139236.5
+      ],
+      "relative_round_spread": 0.10825069025750832,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 141976.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "case_expression",
+      "category": "expression",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 24201.0,
+      "round_medians_ns": [
+        25247.5,
+        25899.0,
+        24201.0,
+        22813.0,
+        23529.0
+      ],
+      "relative_round_spread": 0.1275153919259535,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 24201.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "int64_exact",
+      "category": "types",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 4738.5,
+      "round_medians_ns": [
+        4684.0,
+        4759.0,
+        4738.5,
+        4689.0,
+        4809.0
+      ],
+      "relative_round_spread": 0.02637965600928564,
+      "per_request_samples": 250,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 4738.5,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "window_rank",
+      "category": "window",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 96090.0,
+      "round_medians_ns": [
+        99296.0,
+        93691.0,
+        96090.0,
+        94928.0,
+        97953.5
+      ],
+      "relative_round_spread": 0.058330731605786244,
+      "per_request_samples": 100,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 96090.0,
+      "sampled_peak_pss_kib": null,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 16383858,
+      "round_medians_ns": [
+        16688530,
+        16299258,
+        16383858,
+        16055151,
+        16540279
+      ],
+      "relative_round_spread": 0.03865872128530411,
+      "per_request_samples": 15,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 16383858,
+      "sampled_peak_pss_kib": 14586,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "all_rows_narrow",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 24492030,
+      "round_medians_ns": [
+        25033032,
+        24492030,
+        24705030,
+        24031502,
+        23962864
+      ],
+      "relative_round_spread": 0.04369454063219749,
+      "per_request_samples": 15,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 19687,
+      "sampled_peak_pss_kib": 4502,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "materialized",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 29305991,
+      "round_medians_ns": [
+        29305991,
+        28830534,
+        29505270,
+        29371984,
+        28676696
+      ],
+      "relative_round_spread": 0.02827319506103718,
+      "per_request_samples": 15,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 29305991,
+      "sampled_peak_pss_kib": 35631,
+      "producer": "sqlite-step-cursor"
+    },
+    {
+      "engine": "sqlite-aa",
+      "case": "all_rows_wide",
+      "category": "delivery",
+      "delivery": "consume",
+      "status": "correct",
+      "reasons": [],
+      "median_ns": 70898751,
+      "round_medians_ns": [
+        70898751,
+        71245645,
+        70741664,
+        71082890,
+        70456691
+      ],
+      "relative_round_spread": 0.011127897020357947,
+      "per_request_samples": 15,
+      "p95_ns": null,
+      "p99_ns": null,
+      "median_first_row_ns": 46467,
+      "sampled_peak_pss_kib": 4494,
+      "producer": "sqlite-step-cursor"
+    }
+  ],
+  "cohorts": {
+    "embedded_native": {
+      "sampled_delivery_pss_score": {
+        "sqlite": 100.0,
+        "duckdb": 12.444585908891712,
+        "powdb-powql": 12.61080089798647
+      },
+      "memory_cases": [
+        {
+          "case": "all_rows_narrow",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_narrow",
+          "delivery": "consume"
+        },
+        {
+          "case": "all_rows_wide",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_wide",
+          "delivery": "consume"
+        }
+      ],
+      "memory_reasons": [],
+      "participants": [
+        "sqlite",
+        "duckdb",
+        "powdb-powql"
+      ],
+      "measured": [
+        "sqlite",
+        "duckdb",
+        "powdb-powql"
+      ],
+      "common_cases": [
+        {
+          "case": "point_bound",
+          "delivery": "materialized"
+        },
+        {
+          "case": "point_indexed",
+          "delivery": "materialized"
+        },
+        {
+          "case": "point_missing",
+          "delivery": "materialized"
+        },
+        {
+          "case": "filtered_count",
+          "delivery": "materialized"
+        },
+        {
+          "case": "and_projection",
+          "delivery": "materialized"
+        },
+        {
+          "case": "or_projection",
+          "delivery": "materialized"
+        },
+        {
+          "case": "indexed_in",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_offset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_pk_offset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_pk_keyset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "sum",
+          "delivery": "materialized"
+        },
+        {
+          "case": "avg",
+          "delivery": "materialized"
+        },
+        {
+          "case": "group_having",
+          "delivery": "materialized"
+        },
+        {
+          "case": "distinct",
+          "delivery": "materialized"
+        },
+        {
+          "case": "join_group_having",
+          "delivery": "materialized"
+        },
+        {
+          "case": "in_subquery",
+          "delivery": "materialized"
+        },
+        {
+          "case": "case_expression",
+          "delivery": "materialized"
+        },
+        {
+          "case": "window_rank",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_narrow",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_narrow",
+          "delivery": "consume"
+        },
+        {
+          "case": "all_rows_wide",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_wide",
+          "delivery": "consume"
+        }
+      ],
+      "query_coverage": {
+        "sqlite": {
+          "correct": 33,
+          "required": 33
+        },
+        "duckdb": {
+          "correct": 33,
+          "required": 33
+        },
+        "powdb-powql": {
+          "correct": 33,
+          "required": 33
+        }
+      },
+      "common_query_latency_score": {
+        "sqlite": null,
+        "duckdb": null,
+        "powdb-powql": null
+      },
+      "reasons": [
+        "a common workload failed identical-binary A/A calibration",
+        "a common workload failed request-count or stability gates"
+      ],
+      "correctness_failed": [],
+      "excluded_cases": [
+        {
+          "case": "point_unindexed",
+          "delivery": "materialized"
+        },
+        {
+          "case": "range_page",
+          "delivery": "materialized"
+        },
+        {
+          "case": "unindexed_in",
+          "delivery": "materialized"
+        },
+        {
+          "case": "unindexed_not_in",
+          "delivery": "materialized"
+        },
+        {
+          "case": "null_count",
+          "delivery": "materialized"
+        },
+        {
+          "case": "sort_top100",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_keyset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "join_projection",
+          "delivery": "materialized"
+        },
+        {
+          "case": "compound_join",
+          "delivery": "materialized"
+        },
+        {
+          "case": "exists_correlated",
+          "delivery": "materialized"
+        },
+        {
+          "case": "int64_exact",
+          "delivery": "materialized"
+        }
+      ],
+      "interpretation": "100 equals the fastest observed median in every included common case; no universal or cross-cohort ranking."
+    },
+    "embedded_sql": {
+      "sampled_delivery_pss_score": {
+        "sqlite": 100.0,
+        "duckdb": 12.444585908891712,
+        "powdb-sql": 12.586227675835016
+      },
+      "memory_cases": [
+        {
+          "case": "all_rows_narrow",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_narrow",
+          "delivery": "consume"
+        },
+        {
+          "case": "all_rows_wide",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_wide",
+          "delivery": "consume"
+        }
+      ],
+      "memory_reasons": [],
+      "participants": [
+        "sqlite",
+        "duckdb",
+        "powdb-sql"
+      ],
+      "measured": [
+        "sqlite",
+        "duckdb",
+        "powdb-sql"
+      ],
+      "common_cases": [
+        {
+          "case": "point_indexed",
+          "delivery": "materialized"
+        },
+        {
+          "case": "point_missing",
+          "delivery": "materialized"
+        },
+        {
+          "case": "filtered_count",
+          "delivery": "materialized"
+        },
+        {
+          "case": "and_projection",
+          "delivery": "materialized"
+        },
+        {
+          "case": "or_projection",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_offset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_pk_offset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_pk_keyset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "sum",
+          "delivery": "materialized"
+        },
+        {
+          "case": "avg",
+          "delivery": "materialized"
+        },
+        {
+          "case": "group_having",
+          "delivery": "materialized"
+        },
+        {
+          "case": "distinct",
+          "delivery": "materialized"
+        },
+        {
+          "case": "join_group_having",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_narrow",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_narrow",
+          "delivery": "consume"
+        },
+        {
+          "case": "all_rows_wide",
+          "delivery": "materialized"
+        },
+        {
+          "case": "all_rows_wide",
+          "delivery": "consume"
+        }
+      ],
+      "query_coverage": {
+        "sqlite": {
+          "correct": 33,
+          "required": 33
+        },
+        "duckdb": {
+          "correct": 33,
+          "required": 33
+        },
+        "powdb-sql": {
+          "correct": 25,
+          "required": 33
+        }
+      },
+      "common_query_latency_score": {
+        "sqlite": null,
+        "duckdb": null,
+        "powdb-sql": null
+      },
+      "reasons": [
+        "a common workload failed identical-binary A/A calibration",
+        "a common workload failed request-count or stability gates"
+      ],
+      "correctness_failed": [],
+      "excluded_cases": [
+        {
+          "case": "point_bound",
+          "delivery": "materialized"
+        },
+        {
+          "case": "point_unindexed",
+          "delivery": "materialized"
+        },
+        {
+          "case": "range_page",
+          "delivery": "materialized"
+        },
+        {
+          "case": "indexed_in",
+          "delivery": "materialized"
+        },
+        {
+          "case": "unindexed_in",
+          "delivery": "materialized"
+        },
+        {
+          "case": "unindexed_not_in",
+          "delivery": "materialized"
+        },
+        {
+          "case": "null_count",
+          "delivery": "materialized"
+        },
+        {
+          "case": "sort_top100",
+          "delivery": "materialized"
+        },
+        {
+          "case": "pagination_keyset",
+          "delivery": "materialized"
+        },
+        {
+          "case": "join_projection",
+          "delivery": "materialized"
+        },
+        {
+          "case": "compound_join",
+          "delivery": "materialized"
+        },
+        {
+          "case": "exists_correlated",
+          "delivery": "materialized"
+        },
+        {
+          "case": "in_subquery",
+          "delivery": "materialized"
+        },
+        {
+          "case": "case_expression",
+          "delivery": "materialized"
+        },
+        {
+          "case": "int64_exact",
+          "delivery": "materialized"
+        },
+        {
+          "case": "window_rank",
+          "delivery": "materialized"
+        }
+      ],
+      "interpretation": "100 equals the fastest observed median in every included common case; no universal or cross-cohort ranking."
+    }
+  },
+  "calibration": [
+    {
+      "engine": "sqlite",
+      "case": "point_bound",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.010663254425250623,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "point_indexed",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.0029644268774703386,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "point_missing",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.002096875655273611,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "point_unindexed",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.010705878640401845,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "range_page",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "filtered_count",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.03471805006425521,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "and_projection",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 0.00023395879749465998,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "or_projection",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.020322975799950793,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "indexed_in",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 0.00615679846479833,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "unindexed_in",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "unindexed_not_in",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "null_count",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 0.0025368723529948234,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "sort_top100",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "pagination_offset",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 0.010805228912868836,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "pagination_keyset",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "pagination_pk_offset",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.010484259779910632,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "pagination_pk_keyset",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.00024415850770320713,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "sum",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 0.029263740467132093,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "avg",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.018222472898180353,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "group_having",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 0.006163383224359276,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "distinct",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.0036301872457615847,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "join_projection",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "compound_join",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "join_group_having",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 0.0029830276289632973,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "exists_correlated",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "in_subquery",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 0.0019407061347485044,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "case_expression",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.03205679432056796,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "int64_exact",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": -0.008474576271186418,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "window_rank",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 0.001511282505602063,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "all_rows_narrow",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 0.007509466544818322,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "all_rows_narrow",
+      "delivery": "consume",
+      "pass_gate": true,
+      "relative_delta": 0.022904008895896055,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "all_rows_wide",
+      "delivery": "materialized",
+      "pass_gate": true,
+      "relative_delta": 0.01154489039890838,
+      "same_binary": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "all_rows_wide",
+      "delivery": "consume",
+      "pass_gate": true,
+      "relative_delta": 0.003355142846819925,
+      "same_binary": true
+    },
+    {
+      "engine": "postgres",
+      "case": "point_bound",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "point_indexed",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "point_missing",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "point_unindexed",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "range_page",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "filtered_count",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "and_projection",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "or_projection",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "indexed_in",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "unindexed_in",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "unindexed_not_in",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "null_count",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "sort_top100",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "pagination_offset",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "pagination_keyset",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "pagination_pk_offset",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "pagination_pk_keyset",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "sum",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "avg",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "group_having",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "distinct",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "join_projection",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "compound_join",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "join_group_having",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "exists_correlated",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "in_subquery",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "case_expression",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "int64_exact",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "window_rank",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "all_rows_narrow",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "all_rows_narrow",
+      "delivery": "consume",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "all_rows_wide",
+      "delivery": "materialized",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    },
+    {
+      "engine": "postgres",
+      "case": "all_rows_wide",
+      "delivery": "consume",
+      "pass_gate": false,
+      "relative_delta": null,
+      "same_binary": false
+    }
+  ]
+}

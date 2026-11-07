@@ -1,0 +1,206 @@
+{
+  "schema": 1,
+  "checks": [
+    {
+      "engine": "sqlite",
+      "case": "point_indexed",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "int64_exact",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "sum",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "null_count",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "all_rows_wide",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "all_rows_wide",
+      "delivery": "consume",
+      "pass_gate": true
+    },
+    {
+      "engine": "sqlite",
+      "case": "point_bound",
+      "pass_gate": true
+    },
+    {
+      "engine": "postgres",
+      "case": "point_indexed",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "postgres",
+      "case": "int64_exact",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "postgres",
+      "case": "sum",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "postgres",
+      "case": "null_count",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "postgres",
+      "case": "all_rows_wide",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "postgres",
+      "case": "all_rows_wide",
+      "delivery": "consume",
+      "pass_gate": true
+    },
+    {
+      "engine": "postgres",
+      "case": "point_bound",
+      "pass_gate": true
+    },
+    {
+      "engine": "mysql",
+      "case": "point_indexed",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "mysql",
+      "case": "int64_exact",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "mysql",
+      "case": "sum",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "mysql",
+      "case": "null_count",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "mysql",
+      "case": "all_rows_wide",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "mysql",
+      "case": "all_rows_wide",
+      "delivery": "consume",
+      "pass_gate": true
+    },
+    {
+      "engine": "mysql",
+      "case": "point_bound",
+      "pass_gate": true
+    },
+    {
+      "engine": "powdb-server",
+      "case": "point_indexed",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "powdb-server",
+      "case": "int64_exact",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "powdb-server",
+      "case": "sum",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "powdb-server",
+      "case": "null_count",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "powdb-server",
+      "case": "all_rows_wide",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "powdb-server",
+      "case": "all_rows_wide",
+      "delivery": "consume",
+      "pass_gate": true
+    },
+    {
+      "engine": "powdb-server",
+      "case": "point_bound",
+      "pass_gate": true
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "point_indexed",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "int64_exact",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "sum",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "null_count",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "all_rows_wide",
+      "delivery": "materialized",
+      "pass_gate": true
+    },
+    {
+      "engine": "powdb-server-sql",
+      "case": "all_rows_wide",
+      "delivery": "consume",
+      "pass_gate": true
+    }
+  ],
+  "failures": []
+}

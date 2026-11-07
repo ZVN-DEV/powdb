@@ -82,8 +82,10 @@ the 64-bit ID to its native `INTEGER PRIMARY KEY`. Other physical layouts remain
 engine-specific. Compound `(score,id)` pagination is deliberately unindexed;
 separate ID pagination tests exercise the existing primary-key index.
 
-Fixture inserts run in an explicit transaction outside timing. The loader exits
-before the measured worker starts. Checkpointing precedes measurement where the
+Fixture inserts run in an explicit transaction outside timing. The fixture
+client exits before the measured client starts. For embedded engines this also
+destroys the loader engine. Owned servers stay running and can retain their
+setup buffers and allocator state. Checkpointing precedes measurement where the
 adapter exposes it; PowDB's server persists fixture writes at statement/commit
 boundaries without a benchmark-only checkpoint API. Every round creates new
 fixtures. Round order rotates engines and workloads, rather than always warming
@@ -135,10 +137,12 @@ can fail for a container process; such memory remains unknown, never zero.
 Delivery cases reopen the client/embedded worker before each delivery mode,
 then warm up that mode. This prevents a preceding materialization's retained
 client heap from being attributed to streaming. Owned servers retain their
-normal resident caches/buffers. Other cases can retain state from previous
-workloads. Protocol and result-summary serialization are inside the memory
-sampling interval. Loading allocations are excluded by the separate loader. Use delivery-case memory scores as
-a workload-specific observation, not an independent allocation attribution.
+normal resident caches/buffers and allocator state from fixture loading. Other
+cases can retain state from previous workloads. Protocol and result-summary serialization are inside the memory
+sampling interval. The separate loader excludes client setup allocations and
+embedded engine loading allocations. It does not exclude retained server
+allocations. Use delivery-case memory scores as a workload-specific observation,
+not an independent allocation attribution.
 
 Actual settings accompany each record: versions, durability, memory and thread
 settings where available. Defaults differ: PowDB's query budget is 256 MiB;
@@ -147,6 +151,11 @@ PostgreSQL has shared buffers and work memory; MySQL has an InnoDB buffer pool.
 Server containers have a 2 GiB cgroup cap. These do not establish equal effective
 memory budgets. Larger-than-memory, spill and equal-budget tests are separate
 work. One query worker is used, and query parallelism is disabled where supported.
+The fixture does not explicitly request ANALYZE/optimizer-statistics maintenance.
+Background maintenance stays at engine defaults. This is a fresh-load/default
+configuration profile, not a best-tuned comparison; a statistics-controlled
+profile must be recorded separately.
+
 Full durability is retained for PowDB; SQLite uses WAL/FULL, PostgreSQL keeps
 fsync/synchronous commit/full-page writes, MySQL uses durable InnoDB commit and
 binlog sync settings. Read performance does not prove equivalent crash safety.
