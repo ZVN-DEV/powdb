@@ -125,7 +125,7 @@
       "head-index-page-probe": "da1c458f570fb073534fe5b4ab4f70cf62301c97ed79cf66a2f5e0ca09954fe7"
     },
     "head_commit": "e9f924d",
-    "fixture": "Unique integer id, 60-character payload, reverse insertion, checkpointed before queries; output 100 rows",
+    "fixture": "Unique integer id, 61-character payload, reverse insertion, checkpointed before queries; output 100 rows",
     "surfaces": [
       "execute_powql",
       "execute_powql_readonly"

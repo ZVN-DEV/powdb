@@ -17,7 +17,7 @@ The storage visitor borrows keys, seeks to the lower bound and stops without all
 - Control production code: `a3a83225653d42e73a1ee1ba2b620769f832245b` (main).
 - Candidate production code: `e9f924d`; the same diagnostic driver is added to the control tooling only.
 - Separate build directories, optimized default-feature builds, no test instrumentation; Rust 1.99.1 and no rustflags override.
-- Shared Fjord host: AMD RYZEN AI MAX+ 395 w/ Radeon 8060S. Each measured process was pinned to CPU 8; no core reservation, desktop shutdown or exclusive hardware was used.
+- Shared developer workstation: AMD RYZEN AI MAX+ 395 w/ Radeon 8060S. Each measured process was pinned to CPU 8; no core reservation, desktop shutdown or exclusive hardware was used.
 - Five alternating control/candidate pairs. Each binary loads fresh 1K/10K/100K fixtures, checkpoints them, warms each case three times, then records seven calls per case/surface. Both binaries are built before measurement.
 - Each result is checked for columns, all 100 ordered IDs and every payload. Summary cells are medians of five per-run medians. Timed execution includes result materialization; verification is outside timing.
 - `all_qualify` starts at zero; `last_100` seeks to the final 100 keys. Output cardinality is fixed. No competing database or durable write is timed.
@@ -39,7 +39,7 @@ All values are microseconds. These are local diagnostic medians; shared-host var
 
 The candidate removes growth with qualifying range cardinality in this fixed-output probe. Cases that already qualified only 100 keys stay in roughly the same latency range; the samples do not establish a consistent improvement for those cases. This does not establish scaling beyond the recorded fixtures, behavior under concurrent writers, or superiority to another database.
 
-Raw observations, binary hashes, host/compiler details and pair order: [JSON evidence](2026-11-08-index-pages.json). SHA-256 of the JSON: `7c12f9e2af25e8e736a3c5ad1d2ecefe141d5685d3a5c963e930e8f5e76b3628`.
+Raw observations, binary hashes, host/compiler details and pair order: [JSON evidence](2026-11-08-index-pages.json). SHA-256 of the JSON: `761f550a3403cb2108ad6a3cb0b569d2014b52e8d46ac5141b198f1d3ce05412`.
 
 ## Correctness and verification
 

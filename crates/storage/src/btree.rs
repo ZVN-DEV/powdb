@@ -2501,7 +2501,7 @@ mod tests {
     }
 
     #[test]
-    fn visitor_seeks_and_stops_without_walking_the_remaining_leaves() {
+    fn test_range_visitor_seeks_and_stops_without_walking_the_remaining_leaves() {
         let mut tree = temp_btree("range_visitor_stop");
         for value in 0..20_000 {
             tree.insert(
@@ -2547,7 +2547,7 @@ mod tests {
     }
 
     #[test]
-    fn visitor_bounds_duplicates_and_errors() {
+    fn test_range_visitor_bounds_duplicates_and_errors() {
         let mut tree = temp_btree("range_visitor_bounds");
         // Equal raw keys may span several leaves, as on expression indexes.
         for value in 0..1000 {
@@ -2610,7 +2610,7 @@ mod tests {
     }
 
     #[test]
-    fn visitor_cancels_across_empty_leaves() {
+    fn test_range_visitor_cancels_across_empty_leaves() {
         let mut tree = temp_btree("range_visitor_empty_leaves");
         for value in 0..2000 {
             tree.insert(
