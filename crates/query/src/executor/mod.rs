@@ -1708,6 +1708,9 @@ impl Engine {
         // a negative slice count before evaluating any row (see `dispatch_mut`
         // for the rationale).
         validate_plan(&self.catalog, plan)?;
+        if let Some(result) = self.try_bounded_index_page(plan)? {
+            return Ok(result);
+        }
         match plan {
             PlanNode::ExprIndexScan { .. }
             | PlanNode::ExprRangeScan { .. }

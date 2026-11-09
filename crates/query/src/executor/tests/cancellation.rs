@@ -92,6 +92,50 @@ pub(super) fn cancel_after_checkpoint(
 }
 
 #[test]
+fn bounded_index_page_cancels_during_traversal_on_both_surfaces() {
+    let dir = tempfile::tempdir().expect("database");
+    let mut engine = Engine::new(dir.path()).expect("open");
+    engine
+        .execute_powql("type Page { required unique id: int }")
+        .expect("schema");
+    for id in 0..10_000 {
+        engine
+            .catalog_mut()
+            .get_table_mut("Page")
+            .expect("table")
+            .insert(&vec![Value::Int(id)])
+            .expect("row");
+    }
+    for readonly in [false, true] {
+        let cancel = CancelArc::new(ExecCancel::new());
+        // Entry, root descent and first leaf precede the next-leaf checkpoint.
+        let signal = cancel_after_checkpoint(CancelArc::clone(&cancel), 4);
+        let (result, work) = crate::executor::capture_query_work(|| {
+            if readonly {
+                engine.execute_powql_readonly_with_cancel("Page order .id limit 9000", cancel)
+            } else {
+                engine.execute_powql_with_cancel("Page order .id limit 9000", cancel)
+            }
+        });
+        signal.join().expect("cancellation signal");
+        assert!(matches!(result, Err(QueryError::Cancelled)));
+        assert!(
+            work.index_entries > 0 && work.index_entries < 9000,
+            "{work:?}"
+        );
+        assert_eq!(work.heap_fetches, work.index_entries);
+        assert_eq!(work.seq_rows, 0);
+        assert_eq!(
+            engine
+                .execute_powql("Page order .id limit 1")
+                .expect("next query")
+                .row_count(),
+            1
+        );
+    }
+}
+
+#[test]
 fn nested_loop_join_honors_deadline() {
     // 1200 x 1200 = 1.44M inner iterations of the unindexed nested-loop join —
     // seconds of work uninstrumented. With a ~100ms deadline it must return the

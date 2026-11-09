@@ -80,6 +80,11 @@ name = "unindexed-membership-gate"
 path = "src/bin/unindexed_membership_gate.rs"
 test = false
 
+[[bin]]
+name = "index-page-probe"
+path = "src/bin/index_page_probe.rs"
+test = false
+
 [[bench]]
 name = "powql"
 harness = false

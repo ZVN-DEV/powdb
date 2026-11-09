@@ -64,6 +64,9 @@ impl Engine {
         validate_plan(&self.catalog, plan)?;
         self.ensure_plan_allowed(plan)?;
         self.begin_plan_mutation(plan)?;
+        if let Some(result) = self.try_bounded_index_page(plan)? {
+            return Ok(result);
+        }
         match plan {
             PlanNode::ExprIndexScan { .. }
             | PlanNode::ExprRangeScan { .. }

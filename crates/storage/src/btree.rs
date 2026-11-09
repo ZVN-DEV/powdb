@@ -3,6 +3,7 @@ use crc32fast::Hasher as Crc32Hasher;
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::ops::{Bound, ControlFlow};
 use std::path::Path;
 
 const ORDER: usize = 256;
@@ -1380,6 +1381,65 @@ impl BTree {
         removed
     }
 
+    /// Visit a range in ascending key order without collecting matching keys.
+    ///
+    /// Bounds apply to the stored keys (composite keys for non-unique indexes).
+    /// `checkpoint` runs before every tree node, including empty leaves, so a
+    /// caller can cancel traversal even when no entries reach `visit`. Returning
+    /// `Break` from `visit` stops immediately. Visitor/checkpoint errors are
+    /// propagated without visiting further entries. Traversal uses constant
+    /// auxiliary space and borrows keys rather than cloning them.
+    pub fn try_for_each_range<E>(
+        &self,
+        start: Bound<&Value>,
+        end: Bound<&Value>,
+        mut checkpoint: impl FnMut() -> Result<(), E>,
+        mut visit: impl FnMut(&Value, RowId) -> Result<ControlFlow<()>, E>,
+    ) -> Result<(), E> {
+        let mut node_id = self.root;
+        loop {
+            checkpoint()?;
+            match &self.nodes[node_id] {
+                Node::Internal { keys, children } => {
+                    // Inclusive seeks must also find duplicates straddling
+                    // leaves, including a key equal to an internal separator.
+                    let pos = match start {
+                        Bound::Included(value) => keys.partition_point(|key| key < value),
+                        Bound::Excluded(value) => keys.partition_point(|key| key <= value),
+                        Bound::Unbounded => 0,
+                    };
+                    node_id = children[pos];
+                }
+                Node::Leaf {
+                    keys,
+                    values,
+                    next_leaf,
+                } => {
+                    let first = match start {
+                        Bound::Included(value) => keys.partition_point(|key| key < value),
+                        Bound::Excluded(value) => keys.partition_point(|key| key <= value),
+                        Bound::Unbounded => 0,
+                    };
+                    for index in first..keys.len() {
+                        let key = &keys[index];
+                        let past_end = match end {
+                            Bound::Included(value) => key > value,
+                            Bound::Excluded(value) => key >= value,
+                            Bound::Unbounded => false,
+                        };
+                        if past_end || visit(key, values[index])?.is_break() {
+                            return Ok(());
+                        }
+                    }
+                    match next_leaf {
+                        Some(next) => node_id = *next,
+                        None => return Ok(()),
+                    }
+                }
+            }
+        }
+    }
+
     /// Range scan: returns all (key, rid) pairs where start <= key <= end.
     pub fn range<'a>(
         &'a self,
@@ -2438,6 +2498,147 @@ mod tests {
             assert_eq!(rid.page_id, (i / 100) as u32);
             assert_eq!(rid.slot_index, (i % 100) as u16);
         }
+    }
+
+    #[test]
+    fn visitor_seeks_and_stops_without_walking_the_remaining_leaves() {
+        let mut tree = temp_btree("range_visitor_stop");
+        for value in 0..20_000 {
+            tree.insert(
+                Value::Int(value),
+                RowId {
+                    page_id: value as u32,
+                    slot_index: 0,
+                },
+            );
+        }
+        let lower = Value::Int(10_000);
+        let mut nodes = 0;
+        let mut hits = Vec::new();
+        tree.try_for_each_range::<()>(
+            Bound::Excluded(&lower),
+            Bound::Unbounded,
+            || {
+                nodes += 1;
+                Ok(())
+            },
+            |key, rid| {
+                hits.push((key.clone(), rid.page_id));
+                Ok(if hits.len() == 3 {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                })
+            },
+        )
+        .expect("visit");
+        assert_eq!(
+            hits,
+            vec![
+                (Value::Int(10_001), 10_001),
+                (Value::Int(10_002), 10_002),
+                (Value::Int(10_003), 10_003)
+            ]
+        );
+        assert!(
+            nodes < 10,
+            "seek and one page must not walk every leaf: {nodes}"
+        );
+    }
+
+    #[test]
+    fn visitor_bounds_duplicates_and_errors() {
+        let mut tree = temp_btree("range_visitor_bounds");
+        // Equal raw keys may span several leaves, as on expression indexes.
+        for value in 0..1000 {
+            tree.insert_duplicate(
+                Value::Int(value / 300),
+                RowId {
+                    page_id: value as u32,
+                    slot_index: 0,
+                },
+            );
+        }
+        let one = Value::Int(1);
+        let two = Value::Int(2);
+        for (start, end, expected) in [
+            (Bound::Included(&one), Bound::Included(&two), 600),
+            (Bound::Excluded(&one), Bound::Excluded(&two), 0),
+            (Bound::Included(&one), Bound::Excluded(&two), 300),
+            (Bound::Excluded(&two), Bound::Included(&one), 0),
+        ] {
+            let mut hits = 0;
+            tree.try_for_each_range::<()>(
+                start,
+                end,
+                || Ok(()),
+                |_, _| {
+                    hits += 1;
+                    Ok(ControlFlow::Continue(()))
+                },
+            )
+            .expect("bounds");
+            assert_eq!(hits, expected);
+        }
+        let mut nodes = 0;
+        let mut hits = 0;
+        let outcome = tree.try_for_each_range(
+            Bound::Unbounded,
+            Bound::Unbounded,
+            || {
+                nodes += 1;
+                if nodes == 2 {
+                    Err("cancelled")
+                } else {
+                    Ok(())
+                }
+            },
+            |_, _| {
+                hits += 1;
+                Ok(ControlFlow::Continue(()))
+            },
+        );
+        assert_eq!(outcome, Err("cancelled"));
+        assert_eq!(hits, 0, "cancellation during descent must precede entries");
+        let outcome = tree.try_for_each_range(
+            Bound::Unbounded,
+            Bound::Unbounded,
+            || Ok(()),
+            |_, _| Err::<ControlFlow<()>, _>("visitor error"),
+        );
+        assert_eq!(outcome, Err("visitor error"));
+    }
+
+    #[test]
+    fn visitor_cancels_across_empty_leaves() {
+        let mut tree = temp_btree("range_visitor_empty_leaves");
+        for value in 0..2000 {
+            tree.insert(
+                Value::Int(value),
+                RowId {
+                    page_id: value as u32,
+                    slot_index: 0,
+                },
+            );
+        }
+        for value in 0..2000 {
+            assert!(tree.delete(&Value::Int(value)));
+        }
+        let mut checkpoints = 0;
+        let result = tree.try_for_each_range(
+            Bound::Unbounded,
+            Bound::Unbounded,
+            || {
+                checkpoints += 1;
+                if checkpoints == 4 {
+                    Err("cancelled empty traversal")
+                } else {
+                    Ok(())
+                }
+            },
+            |_, _| panic!("deleted keys must not be visited"),
+        );
+        assert_eq!(result, Err("cancelled empty traversal"));
     }
 
     #[test]
