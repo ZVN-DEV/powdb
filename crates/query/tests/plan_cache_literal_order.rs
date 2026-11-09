@@ -65,6 +65,34 @@ fn a_projection_literal_survives_a_limit() {
 }
 
 #[test]
+fn trailing_projection_literals_do_not_swap_with_slice_counts() {
+    let (_dir, mut engine) = engine();
+    for (query, expected) in [
+        (
+            "D order .id limit 2 { x: .n + 100 }",
+            vec![vec![Value::Int(103)], vec![Value::Int(110)]],
+        ),
+        (
+            "D order .id limit 1 offset 1 { x: .n + 200 }",
+            vec![vec![Value::Int(210)]],
+        ),
+        (
+            "D order .id offset 1 { x: .n + 300 }",
+            vec![vec![Value::Int(310)], vec![Value::Int(320)]],
+        ),
+    ] {
+        assert_eq!(stable(&mut engine, query), expected);
+        for _ in 0..3 {
+            let QueryResult::Rows { rows, .. } = engine.execute_powql_readonly(query).expect(query)
+            else {
+                panic!("rows")
+            };
+            assert_eq!(rows, expected);
+        }
+    }
+}
+
+#[test]
 fn a_projection_literal_survives_a_limit_and_an_offset() {
     let (_dir, mut engine) = engine();
     assert_eq!(
