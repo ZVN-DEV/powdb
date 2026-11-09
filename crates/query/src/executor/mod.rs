@@ -1708,9 +1708,6 @@ impl Engine {
         // a negative slice count before evaluating any row (see `dispatch_mut`
         // for the rationale).
         validate_plan(&self.catalog, plan)?;
-        if let Some(result) = self.try_bounded_index_page(plan)? {
-            return Ok(result);
-        }
         match plan {
             PlanNode::ExprIndexScan { .. }
             | PlanNode::ExprRangeScan { .. }
@@ -2221,6 +2218,14 @@ impl Engine {
                         keys,
                     } = inner.as_ref()
                     {
+                        if matches!(
+                            sort_input.as_ref(),
+                            PlanNode::SeqScan { .. } | PlanNode::RangeScan { .. }
+                        ) {
+                            if let Some(result) = self.try_bounded_index_page(plan)? {
+                                return Ok(result);
+                            }
+                        }
                         if keys.len() == 1 {
                             if let (Expr::Field(sort_field), Some(limit)) =
                                 (&keys[0].expr, literal_limit(limit_expr))
@@ -2404,6 +2409,13 @@ impl Engine {
             }
 
             PlanNode::Limit { input, count } => {
+                if matches!(input.as_ref(), PlanNode::Sort { input: source, .. }
+                    if matches!(source.as_ref(), PlanNode::SeqScan { .. } | PlanNode::RangeScan { .. }))
+                {
+                    if let Some(result) = self.try_bounded_index_page(plan)? {
+                        return Ok(result);
+                    }
+                }
                 let result = self.dispatch_readonly(input)?;
                 let n = match count {
                     Expr::Literal(Literal::Int(v)) => *v as usize,

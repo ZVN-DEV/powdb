@@ -64,9 +64,6 @@ impl Engine {
         validate_plan(&self.catalog, plan)?;
         self.ensure_plan_allowed(plan)?;
         self.begin_plan_mutation(plan)?;
-        if let Some(result) = self.try_bounded_index_page(plan)? {
-            return Ok(result);
-        }
         match plan {
             PlanNode::ExprIndexScan { .. }
             | PlanNode::ExprRangeScan { .. }
@@ -342,6 +339,14 @@ impl Engine {
                         keys,
                     } = inner.as_ref()
                     {
+                        if matches!(
+                            sort_input.as_ref(),
+                            PlanNode::SeqScan { .. } | PlanNode::RangeScan { .. }
+                        ) {
+                            if let Some(result) = self.try_bounded_index_page(plan)? {
+                                return Ok(result);
+                            }
+                        }
                         // Fast path only for single-key sorts, and only for a
                         // bound this path may act on, an unreadable count is
                         // the generic `Limit` arm's error to report.
@@ -548,6 +553,13 @@ impl Engine {
             }
 
             PlanNode::Limit { input, count } => {
+                if matches!(input.as_ref(), PlanNode::Sort { input: source, .. }
+                    if matches!(source.as_ref(), PlanNode::SeqScan { .. } | PlanNode::RangeScan { .. }))
+                {
+                    if let Some(result) = self.try_bounded_index_page(plan)? {
+                        return Ok(result);
+                    }
+                }
                 let result = self.dispatch_mut(input)?;
                 let n = match count {
                     Expr::Literal(Literal::Int(v)) => *v as usize,
