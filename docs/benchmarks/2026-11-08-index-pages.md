@@ -2,7 +2,7 @@
 
 An ascending page over a matching unique integer index now stops at its requested rows. The prior path collected all matching index keys, fetched their rows and sorted them before applying the limit. This diagnostic measures that mechanism against unchanged main, not an overall database ranking or an isolated-host speed claim.
 
-Broad performance qualification remains open: the initial local gate failed. The fixed-output diagnostic below does not waive that result.
+The refined build passes all 22 local regression checks and the existing ratio checks after dispatch integration was narrowed. This workstation run is explicitly non-authoritative because it differs from the recorded hosted environment. Current-head CI and hosted performance qualification remain pending; the initial failed run is retained below.
 
 ## Scope
 
@@ -47,7 +47,7 @@ Raw observations, binary hashes, host/compiler details and pair order: [refined 
 
 The initial full local run failed six same-instance workload checks and one ratio ceiling. [Full original estimates and failure table](2026-11-08-index-pages-broad-initial.json) are retained. The environment guard first refused comparison against the hosted baseline; its explicit diagnostic override was then used. That run is not authoritative and does not qualify performance.
 
-[Serial main/candidate/main controls](2026-11-08-index-pages-focused-controls.json) reproduced three unrelated fast-path slowdowns in the initial version. The refinement confines index-page probing to potentially eligible sort/limit branches instead of probing every dispatched plan. [Fresh serial controls](2026-11-08-index-pages-refined-controls.json) put all six originally flagged workloads within their unchanged thresholds against both surrounding main runs. Main-to-main drift nevertheless exceeded 10% in two controls, so those timings remain diagnostic. The complete refined broad run and hosted gate are still required; no baseline or threshold is changed.
+[Serial main/candidate/main controls](2026-11-08-index-pages-focused-controls.json) reproduced three unrelated fast-path slowdowns in the initial version. The refinement confines index-page probing to potentially eligible sort/limit branches instead of probing every dispatched plan. [Fresh serial controls](2026-11-08-index-pages-refined-controls.json) put all six originally flagged workloads within their unchanged thresholds against both surrounding main runs. Main-to-main drift nevertheless exceeded 10% in two controls, so those timings remain diagnostic. The [complete refined local run](2026-11-08-index-pages-broad-refined.json) then passed all 22 regression checks and all ratio checks under the comparator's explicit non-authoritative environment override. The original environment refusal is not bypassed by spoofing runner/flag values: recorded flags remain empty. The [fresh hosted gate](https://github.com/ZVN-DEV/powdb/actions/runs/42556288532) must still be reviewed before shipping; no baseline or threshold is changed.
 
 ## Correctness and verification
 
@@ -56,7 +56,7 @@ The initial full local run failed six same-instance workload checks and one rati
 - Low-budget tests accept small pages and reject large pages with typed memory-limit errors. Cancellation tests stop during traversal and across empty leaves.
 - The existing cross-product access-path equivalence corpus includes the new path. The full local quality sweep passes (workspace tests/doc tests, strict Clippy, TypeScript live tests and package/import smokes); cargo-audit and gitleaks are unavailable locally and remain CI checks.
 - Regression tests also cover a pre-existing projection/limit literal-cache ordering bug discovered during parity checks. Ambiguous cache shapes now replan.
-- The full local quality sweep also passes for the dispatch refinement. `cargo run --release -p powdb-compare --bin compare-engines` completed as a contributor check; its legacy summary is not used to establish rankings here. Broad performance qualification remains open as described above.
+- The full local quality sweep also passes for the dispatch refinement. `cargo run --release -p powdb-compare --bin compare-engines` completed as a contributor check; its legacy summary is not used to establish rankings here. Local regression checks now pass; current-head CI and hosted qualification remain open as described above.
 
 ## Reproduce
 
