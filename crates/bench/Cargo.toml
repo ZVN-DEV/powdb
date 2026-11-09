@@ -85,6 +85,11 @@ name = "index-page-probe"
 path = "src/bin/index_page_probe.rs"
 test = false
 
+[[bin]]
+name = "page-gather-probe"
+path = "src/bin/page_gather_probe.rs"
+test = true
+
 [[bench]]
 name = "powql"
 harness = false
