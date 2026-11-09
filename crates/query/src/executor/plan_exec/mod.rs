@@ -338,6 +338,7 @@ mod aggregate;
 mod coerce;
 mod dispatch;
 mod fast_paths;
+mod index_page;
 mod join;
 mod lowering;
 mod mutation;
