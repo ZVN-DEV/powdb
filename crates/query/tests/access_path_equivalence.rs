@@ -413,6 +413,11 @@ struct Case {
 }
 
 const READ_CASES: &[Case] = &[
+    Case {
+        powql: "{t} filter .id > 2 order .id limit 3 { .id, .n }",
+        driver: Driver::Range("id"),
+        ordered: true,
+    },
     // ── single-column drivers, per type ──
     Case {
         powql: "{t} filter .n = 3 { .id, .n }",
@@ -943,6 +948,12 @@ struct DivertedShape {
 /// planner stopped producing the shape; both make the equivalence runner blind
 /// to that path, which is worse than not having it.
 const DIVERTED_SHAPES: &[DivertedShape] = &[
+    DivertedShape {
+        access: Access::NoIndex,
+        query: "T filter .id > 2 order .id limit 3 { .id, .n }",
+        site: "bounded-index-page",
+        what: "bounded ascending unique integer page",
+    },
     DivertedShape {
         access: Access::NoIndex,
         query: "T filter .n = 3 { .id, .n }",
@@ -1518,6 +1529,7 @@ fn every_read_shape_refreshes_a_dirty_materialized_view() {
 /// Both surface here as a reviewable diff instead of as silence.
 const SITES_REACHED_BY_THE_CORPUS: &[&str] = &[
     "agg-single-col",
+    "bounded-index-page",
     "count-fast-block",
     "delete-fused",
     "filter-index-residual",

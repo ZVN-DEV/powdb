@@ -13,6 +13,8 @@ pub struct QueryWork {
     pub seq_rows: u64,
     /// Equality index probes made by instrumented execution paths.
     pub index_probes: u64,
+    /// Entries delivered by instrumented bounded index traversals.
+    pub index_entries: u64,
     /// Heap row fetch attempts made by instrumented execution paths.
     pub heap_fetches: u64,
 }
@@ -22,6 +24,7 @@ impl QueryWork {
         Self {
             seq_rows: self.seq_rows.saturating_add(other.seq_rows),
             index_probes: self.index_probes.saturating_add(other.index_probes),
+            index_entries: self.index_entries.saturating_add(other.index_entries),
             heap_fetches: self.heap_fetches.saturating_add(other.heap_fetches),
         }
     }
@@ -76,6 +79,10 @@ pub(super) fn record_heap_fetch() {
     record(|work| work.heap_fetches = work.heap_fetches.saturating_add(1));
 }
 
+pub(super) fn record_index_entry() {
+    record(|work| work.index_entries = work.index_entries.saturating_add(1));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,6 +106,7 @@ mod tests {
             QueryWork {
                 seq_rows: 1,
                 index_probes: 1,
+                index_entries: 0,
                 heap_fetches: 1
             }
         );

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- Ordered pages over a matching unique integer index stop traversal after the
+  requested rows instead of collecting every matching key and sorting all
+  matches. The initial path supports ascending order, literal limits, and
+  plain-field projections on mutable and concurrent read-only execution;
+  offsets, residual filters and other shapes retain their existing paths.
+  Unfiltered nullable keys retain the generic path so null rows are preserved.
+
+### Fixed
+
+- Repeated queries with literals in both a projection and a limit/offset no
+  longer swap those values when clauses are written in different orders.
+  These ambiguous shapes replan until source literal positions are preserved.
+
 ## [0.29.2] - 2026-11-06
 
 This patch reduces repeated decoding and allocation in eligible read paths.

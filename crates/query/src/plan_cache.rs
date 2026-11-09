@@ -102,12 +102,12 @@ impl PlanCache {
         if nested_projection_defeats_cache(&plan) {
             return;
         }
-        // A projection may be written before or after `order`, and the plan
+        // A projection may be written before or after order/limit/offset, and the plan
         // keeps no record of which, so when both carry a literal the walk
         // cannot know which one the source wrote first. Same reasoning as
         // grouped HAVING above: replanning is cheaper than ever serving
         // silently rebound literals.
-        if projection_and_sort_literals_are_ambiguous(&plan) {
+        if projection_and_slice_or_sort_literals_are_ambiguous(&plan) {
             return;
         }
         if count_literal_slots(&plan) != source_literal_count {
@@ -283,8 +283,8 @@ fn count_nested_projection(nested: &crate::plan::NestedProjection, n: &mut usize
 }
 
 /// Whether the plan has a literal in a projection field AND a literal in a
-/// sort key, the one pair whose source order the plan cannot reconstruct.
-fn projection_and_sort_literals_are_ambiguous(plan: &PlanNode) -> bool {
+/// sort key or slice, whose source order the plan cannot reconstruct.
+fn projection_and_slice_or_sort_literals_are_ambiguous(plan: &PlanNode) -> bool {
     let (mut projection, mut sort) = (false, false);
     scan_literal_clauses(plan, &mut projection, &mut sort);
     projection && sort
@@ -300,9 +300,11 @@ fn scan_literal_clauses(plan: &PlanNode, projection: &mut bool, sort: &mut bool)
             *sort |= keys.iter().any(|key| expr_has_literal(&key.expr));
             scan_literal_clauses(input, projection, sort);
         }
+        PlanNode::Limit { input, count } | PlanNode::Offset { input, count } => {
+            *sort |= expr_has_literal(count);
+            scan_literal_clauses(input, projection, sort);
+        }
         PlanNode::Filter { input, .. }
-        | PlanNode::Limit { input, .. }
-        | PlanNode::Offset { input, .. }
         | PlanNode::Aggregate { input, .. }
         | PlanNode::Distinct { input }
         | PlanNode::GroupBy { input, .. }
