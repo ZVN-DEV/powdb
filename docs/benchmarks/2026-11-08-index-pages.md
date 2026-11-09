@@ -2,6 +2,8 @@
 
 An ascending page over a matching unique integer index now stops at its requested rows. The prior path collected all matching index keys, fetched their rows and sorted them before applying the limit. This diagnostic measures that mechanism against unchanged main, not an overall database ranking or an isolated-host speed claim.
 
+Broad performance qualification remains open: the initial local gate failed. The fixed-output diagnostic below does not waive that result.
+
 ## Scope
 
 ```powql
@@ -15,7 +17,7 @@ The storage visitor borrows keys, seeks to the lower bound and stops without all
 ## Provenance and method
 
 - Control production code: `a3a83225653d42e73a1ee1ba2b620769f832245b` (main).
-- Candidate production code: `e9f924d`; the same diagnostic driver is added to the control tooling only.
+- Candidate production code: `e5fba68d4a4ab211eac6a0c2847410db47a0615e`; the same diagnostic driver is added to the control tooling only.
 - Separate build directories, optimized default-feature builds, no test instrumentation; Rust 1.99.1 and no rustflags override.
 - Shared developer workstation: AMD RYZEN AI MAX+ 395 w/ Radeon 8060S. Each measured process was pinned to CPU 8; no core reservation, desktop shutdown or exclusive hardware was used.
 - Five alternating control/candidate pairs. Each binary loads fresh 1K/10K/100K fixtures, checkpoints them, warms each case three times, then records seven calls per case/surface. Both binaries are built before measurement.
@@ -30,16 +32,22 @@ All values are microseconds. These are local diagnostic medians; shared-host var
 
 | Fixture rows | Surface | All qualify: control | All qualify: candidate | Last 100: control | Last 100: candidate |
 | --- | --- | ---: | ---: | ---: | ---: |
-| 1,000 | Mutable | 766.546 | 50.435 | 93.265 | 58.871 |
-| 1,000 | Read-only | 889.476 | 52.949 | 96.420 | 59.141 |
-| 10,000 | Mutable | 7,159.972 | 45.335 | 59.281 | 56.917 |
-| 10,000 | Read-only | 6,552.623 | 42.850 | 62.718 | 63.709 |
-| 100,000 | Mutable | 74,206.769 | 42.780 | 60.112 | 61.425 |
-| 100,000 | Read-only | 72,055.329 | 44.994 | 61.345 | 59.492 |
+| 1,000 | Mutable | 543.097 | 49.613 | 63.298 | 55.885 |
+| 1,000 | Read-only | 541.855 | 50.966 | 60.844 | 57.497 |
+| 10,000 | Mutable | 5,645.287 | 40.396 | 59.702 | 56.857 |
+| 10,000 | Read-only | 5,529.280 | 50.645 | 59.832 | 57.959 |
+| 100,000 | Mutable | 63,884.098 | 43.742 | 61.294 | 81.422 |
+| 100,000 | Read-only | 60,525.015 | 63.990 | 59.973 | 83.676 |
 
 The candidate removes growth with qualifying range cardinality in this fixed-output probe. Cases that already qualified only 100 keys stay in roughly the same latency range; the samples do not establish a consistent improvement for those cases. This does not establish scaling beyond the recorded fixtures, behavior under concurrent writers, or superiority to another database.
 
-Raw observations, binary hashes, host/compiler details and pair order: [JSON evidence](2026-11-08-index-pages.json). SHA-256 of the JSON: `761f550a3403cb2108ad6a3cb0b569d2014b52e8d46ac5141b198f1d3ce05412`.
+Raw observations, binary hashes, host/compiler details and pair order: [refined JSON evidence](2026-11-08-index-pages-refined.json). SHA-256: `eeea99bb6ec572bdee105d3243c2b8b4c2a673966d6d3b094a98bdeee26ae92a`. The [initial page measurements](2026-11-08-index-pages.json) remain retained at their original source revision.
+
+## Broad performance qualification
+
+The initial full local run failed six same-instance workload checks and one ratio ceiling. [Full original estimates and failure table](2026-11-08-index-pages-broad-initial.json) are retained. The environment guard first refused comparison against the hosted baseline; its explicit diagnostic override was then used. That run is not authoritative and does not qualify performance.
+
+[Serial main/candidate/main controls](2026-11-08-index-pages-focused-controls.json) reproduced three unrelated fast-path slowdowns in the initial version. The refinement confines index-page probing to potentially eligible sort/limit branches instead of probing every dispatched plan. [Fresh serial controls](2026-11-08-index-pages-refined-controls.json) put all six originally flagged workloads within their unchanged thresholds against both surrounding main runs. Main-to-main drift nevertheless exceeded 10% in two controls, so those timings remain diagnostic. The complete refined broad run and hosted gate are still required; no baseline or threshold is changed.
 
 ## Correctness and verification
 
@@ -48,7 +56,7 @@ Raw observations, binary hashes, host/compiler details and pair order: [JSON evi
 - Low-budget tests accept small pages and reject large pages with typed memory-limit errors. Cancellation tests stop during traversal and across empty leaves.
 - The existing cross-product access-path equivalence corpus includes the new path. The full local quality sweep passes (workspace tests/doc tests, strict Clippy, TypeScript live tests and package/import smokes); cargo-audit and gitleaks are unavailable locally and remain CI checks.
 - Regression tests also cover a pre-existing projection/limit literal-cache ordering bug discovered during parity checks. Ambiguous cache shapes now replan.
-- Broad Criterion regression validation is recorded separately when completed. No baseline or threshold is changed.
+- The full local quality sweep also passes for the dispatch refinement. `cargo run --release -p powdb-compare --bin compare-engines` completed as a contributor check; its legacy summary is not used to establish rankings here. Broad performance qualification remains open as described above.
 
 ## Reproduce
 

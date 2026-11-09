@@ -1,0 +1,2397 @@
+{
+  "manifest": {
+    "control_commit": "a3a83225653d42e73a1ee1ba2b620769f832245b",
+    "machine": "Linux-7.2.8-9-omarchy-x86_64-with-glibc2.44",
+    "cpu_affinity": [
+      8
+    ],
+    "isolated": false,
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "rustflags": null,
+    "pairs": [
+      {
+        "pair": 0,
+        "variant": "control",
+        "path": "page-0-control.json",
+        "elapsed_seconds": 1.4305875301361084,
+        "loadavg": [
+          5.13330078125,
+          15.48779296875,
+          34.22509765625
+        ]
+      },
+      {
+        "pair": 0,
+        "variant": "head",
+        "path": "page-0-head.json",
+        "elapsed_seconds": 0.042680978775024414,
+        "loadavg": [
+          5.13330078125,
+          15.48779296875,
+          34.22509765625
+        ]
+      },
+      {
+        "pair": 1,
+        "variant": "head",
+        "path": "page-1-head.json",
+        "elapsed_seconds": 0.04282569885253906,
+        "loadavg": [
+          5.13330078125,
+          15.48779296875,
+          34.22509765625
+        ]
+      },
+      {
+        "pair": 1,
+        "variant": "control",
+        "path": "page-1-control.json",
+        "elapsed_seconds": 1.369551181793213,
+        "loadavg": [
+          5.13330078125,
+          15.48779296875,
+          34.22509765625
+        ]
+      },
+      {
+        "pair": 2,
+        "variant": "control",
+        "path": "page-2-control.json",
+        "elapsed_seconds": 1.349473476409912,
+        "loadavg": [
+          5.13330078125,
+          15.48779296875,
+          34.22509765625
+        ]
+      },
+      {
+        "pair": 2,
+        "variant": "head",
+        "path": "page-2-head.json",
+        "elapsed_seconds": 0.05386519432067871,
+        "loadavg": [
+          5.13330078125,
+          15.48779296875,
+          34.22509765625
+        ]
+      },
+      {
+        "pair": 3,
+        "variant": "head",
+        "path": "page-3-head.json",
+        "elapsed_seconds": 0.07185745239257812,
+        "loadavg": [
+          5.13330078125,
+          15.48779296875,
+          34.22509765625
+        ]
+      },
+      {
+        "pair": 3,
+        "variant": "control",
+        "path": "page-3-control.json",
+        "elapsed_seconds": 2.106323003768921,
+        "loadavg": [
+          9.767578125,
+          16.27685546875,
+          34.3798828125
+        ]
+      },
+      {
+        "pair": 4,
+        "variant": "control",
+        "path": "page-4-control.json",
+        "elapsed_seconds": 2.0973732471466064,
+        "loadavg": [
+          9.767578125,
+          16.27685546875,
+          34.3798828125
+        ]
+      },
+      {
+        "pair": 4,
+        "variant": "head",
+        "path": "page-4-head.json",
+        "elapsed_seconds": 0.07155823707580566,
+        "loadavg": [
+          9.767578125,
+          16.27685546875,
+          34.3798828125
+        ]
+      }
+    ],
+    "binary_sha256": {
+      "control-index-page-probe": "92ac14d05dd8fbe48d6935c192bebff8bcb7cecc63c5179d37bad2550deb3073",
+      "head-index-page-probe": "fb5ee5b89d958de9606b4ffa5b5c97bd46774fb3b236a4c36fc408147f2e1543"
+    },
+    "head_production_commit": "e5fba68d4a4ab211eac6a0c2847410db47a0615e",
+    "default_features_only": true,
+    "cpu_model": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
+  },
+  "summary": [
+    {
+      "fixture_rows": 1000,
+      "readonly": false,
+      "case": "all_qualify",
+      "control_median_us": 543.097,
+      "head_median_us": 49.613,
+      "control_pair_medians_us": [
+        543.097,
+        539.321,
+        530.133,
+        600.084,
+        888.615
+      ],
+      "head_pair_medians_us": [
+        48.891999999999996,
+        48.980999999999995,
+        49.613,
+        83.166,
+        79.299
+      ]
+    },
+    {
+      "fixture_rows": 1000,
+      "readonly": false,
+      "case": "last_100",
+      "control_median_us": 63.298,
+      "head_median_us": 55.885,
+      "control_pair_medians_us": [
+        58.75,
+        63.298,
+        57.838,
+        93.015,
+        93.96600000000001
+      ],
+      "head_pair_medians_us": [
+        55.223000000000006,
+        55.223000000000006,
+        55.885,
+        85.991,
+        91.61200000000001
+      ]
+    },
+    {
+      "fixture_rows": 1000,
+      "readonly": true,
+      "case": "all_qualify",
+      "control_median_us": 541.855,
+      "head_median_us": 50.966,
+      "control_pair_medians_us": [
+        518.612,
+        541.855,
+        529.322,
+        858.618,
+        886.381
+      ],
+      "head_pair_medians_us": [
+        50.966,
+        50.805,
+        50.815,
+        83.777,
+        76.07300000000001
+      ]
+    },
+    {
+      "fixture_rows": 1000,
+      "readonly": true,
+      "case": "last_100",
+      "control_median_us": 60.844,
+      "head_median_us": 57.497,
+      "control_pair_medians_us": [
+        58.349,
+        60.844,
+        59.091,
+        93.044,
+        96.13000000000001
+      ],
+      "head_pair_medians_us": [
+        57.497,
+        56.746,
+        57.047,
+        86.422,
+        92.21300000000001
+      ]
+    },
+    {
+      "fixture_rows": 10000,
+      "readonly": false,
+      "case": "all_qualify",
+      "control_median_us": 5645.286999999999,
+      "head_median_us": 40.396,
+      "control_pair_medians_us": [
+        5644.115,
+        5645.286999999999,
+        5520.664,
+        8814.846,
+        8065.602
+      ],
+      "head_pair_medians_us": [
+        39.614,
+        39.575,
+        40.396,
+        40.476,
+        62.958000000000006
+      ]
+    },
+    {
+      "fixture_rows": 10000,
+      "readonly": false,
+      "case": "last_100",
+      "control_median_us": 59.702,
+      "head_median_us": 56.857,
+      "control_pair_medians_us": [
+        59.702,
+        58.650000000000006,
+        58.429,
+        94.848,
+        93.365
+      ],
+      "head_pair_medians_us": [
+        55.794999999999995,
+        55.594,
+        56.857,
+        85.771,
+        97.62299999999999
+      ]
+    },
+    {
+      "fixture_rows": 10000,
+      "readonly": true,
+      "case": "all_qualify",
+      "control_median_us": 5529.28,
+      "head_median_us": 50.645,
+      "control_pair_medians_us": [
+        5368.368,
+        5529.28,
+        5449.66,
+        8829.162999999999,
+        9229.363000000001
+      ],
+      "head_pair_medians_us": [
+        41.358,
+        40.717000000000006,
+        50.645,
+        66.78500000000001,
+        64.07000000000001
+      ]
+    },
+    {
+      "fixture_rows": 10000,
+      "readonly": true,
+      "case": "last_100",
+      "control_median_us": 59.832,
+      "head_median_us": 57.958999999999996,
+      "control_pair_medians_us": [
+        58.509,
+        59.832,
+        59.261,
+        92.013,
+        102.271
+      ],
+      "head_pair_medians_us": [
+        57.958999999999996,
+        57.247,
+        57.788000000000004,
+        96.42,
+        88.024
+      ]
+    },
+    {
+      "fixture_rows": 100000,
+      "readonly": false,
+      "case": "all_qualify",
+      "control_median_us": 63884.098,
+      "head_median_us": 43.742000000000004,
+      "control_pair_medians_us": [
+        63884.098,
+        60192.521,
+        59431.305,
+        94231.64,
+        93962.215
+      ],
+      "head_pair_medians_us": [
+        41.208000000000006,
+        41.749,
+        50.834999999999994,
+        64.009,
+        43.742000000000004
+      ]
+    },
+    {
+      "fixture_rows": 100000,
+      "readonly": false,
+      "case": "last_100",
+      "control_median_us": 61.294,
+      "head_median_us": 81.422,
+      "control_pair_medians_us": [
+        61.294,
+        58.839999999999996,
+        58.309,
+        92.423,
+        90.87
+      ],
+      "head_pair_medians_us": [
+        55.113,
+        56.255,
+        81.422,
+        90.87,
+        102.202
+      ]
+    },
+    {
+      "fixture_rows": 100000,
+      "readonly": true,
+      "case": "all_qualify",
+      "control_median_us": 60525.015,
+      "head_median_us": 63.99,
+      "control_pair_medians_us": [
+        60525.015,
+        59349.481,
+        60108.625,
+        95492.703,
+        95908.913
+      ],
+      "head_pair_medians_us": [
+        42.78,
+        42.991,
+        63.99,
+        65.422,
+        77.686
+      ]
+    },
+    {
+      "fixture_rows": 100000,
+      "readonly": true,
+      "case": "last_100",
+      "control_median_us": 59.973000000000006,
+      "head_median_us": 83.676,
+      "control_pair_medians_us": [
+        59.973000000000006,
+        59.482,
+        59.421,
+        93.52499999999999,
+        100.819
+      ],
+      "head_pair_medians_us": [
+        56.806,
+        57.268,
+        83.676,
+        93.706,
+        94.086
+      ]
+    }
+  ],
+  "runs": [
+    {
+      "pair": 0,
+      "variant": "control",
+      "instrumentation": false,
+      "memory_limit_bytes": 268435456,
+      "observations": [
+        {
+          "case": "all_qualify",
+          "fixture_rows": 1000,
+          "median_us": 543.097,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            550.8620000000001,
+            539.6310000000001,
+            543.097,
+            538.839,
+            543.558,
+            547.495,
+            539.251
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 1000,
+          "median_us": 518.612,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            516.9480000000001,
+            523.091,
+            516.918,
+            531.857,
+            517.229,
+            521.046,
+            518.612
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 1000,
+          "median_us": 58.75,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            59.01,
+            58.72,
+            59.161,
+            59.06,
+            58.67,
+            58.75,
+            58.56
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 1000,
+          "median_us": 58.349,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            58.64,
+            58.239000000000004,
+            58.55,
+            70.672,
+            58.299,
+            58.288999999999994,
+            58.349
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 10000,
+          "median_us": 5644.115,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            5697.9259999999995,
+            5687.357,
+            5644.115,
+            5655.657,
+            5635.149,
+            5641.9310000000005,
+            5640.498
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 10000,
+          "median_us": 5368.368,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            5362.067,
+            5368.368,
+            5363.610000000001,
+            5382.215,
+            5375.803,
+            5379.009,
+            5363.93
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 10000,
+          "median_us": 59.702,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            60.073,
+            63.749,
+            59.702,
+            59.682,
+            59.821999999999996,
+            59.622,
+            59.391
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 10000,
+          "median_us": 58.509,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            59.291,
+            58.68,
+            58.509,
+            58.119,
+            58.029,
+            58.129,
+            61.746
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 100000,
+          "median_us": 63884.098,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            60262.282,
+            60437.14,
+            61429.059,
+            67831.765,
+            71829.716,
+            75751.384,
+            63884.098
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 100000,
+          "median_us": 60525.015,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            82988.644,
+            60525.015,
+            60153.759,
+            60968.466,
+            60319.659999999996,
+            59742.929000000004,
+            60968.265
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 100000,
+          "median_us": 61.294,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            61.73500000000001,
+            61.305,
+            61.294,
+            61.093999999999994,
+            61.325,
+            60.924,
+            61.144999999999996
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 100000,
+          "median_us": 59.973000000000006,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            59.973000000000006,
+            60.043,
+            60.012,
+            59.561,
+            60.003,
+            59.702,
+            59.442
+          ]
+        }
+      ],
+      "profile": "native-index-page-diagnostic-v1"
+    },
+    {
+      "pair": 0,
+      "variant": "head",
+      "instrumentation": false,
+      "memory_limit_bytes": 268435456,
+      "observations": [
+        {
+          "case": "all_qualify",
+          "fixture_rows": 1000,
+          "median_us": 48.891999999999996,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            49.382000000000005,
+            57.738,
+            48.891999999999996,
+            48.931999999999995,
+            48.461000000000006,
+            48.781,
+            48.761
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 1000,
+          "median_us": 50.966,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            51.416,
+            51.456,
+            50.964999999999996,
+            51.416,
+            50.595,
+            50.966,
+            50.945
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 1000,
+          "median_us": 55.223000000000006,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            55.403,
+            55.184,
+            55.033,
+            55.384,
+            55.223000000000006,
+            55.484,
+            55.193
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 1000,
+          "median_us": 57.497,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            57.217,
+            57.077000000000005,
+            57.086999999999996,
+            66.93599999999999,
+            57.577,
+            57.497,
+            57.698
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 10000,
+          "median_us": 39.614,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            39.824999999999996,
+            39.583999999999996,
+            39.735,
+            39.764,
+            39.483999999999995,
+            39.614,
+            39.153000000000006
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 10000,
+          "median_us": 41.358,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            41.358,
+            40.837,
+            41.478,
+            41.578,
+            41.317,
+            41.147,
+            50.204
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 10000,
+          "median_us": 55.794999999999995,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            55.714000000000006,
+            55.635,
+            55.794999999999995,
+            55.744,
+            55.915,
+            56.115,
+            56.075
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 10000,
+          "median_us": 57.958999999999996,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            57.797999999999995,
+            70.523,
+            57.728,
+            57.958999999999996,
+            57.628,
+            58.219,
+            57.998999999999995
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 100000,
+          "median_us": 41.208000000000006,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            41.047000000000004,
+            41.196999999999996,
+            41.268,
+            41.117,
+            43.191,
+            41.618,
+            41.208000000000006
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 100000,
+          "median_us": 42.78,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            42.72,
+            42.809999999999995,
+            42.88,
+            42.64,
+            42.78,
+            42.830999999999996,
+            42.429
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 100000,
+          "median_us": 55.113,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            55.394,
+            54.742,
+            58.71,
+            55.113,
+            55.163,
+            54.863,
+            54.642
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 100000,
+          "median_us": 56.806,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            56.907000000000004,
+            56.546,
+            56.836000000000006,
+            56.806,
+            56.757,
+            56.586000000000006,
+            56.817
+          ]
+        }
+      ],
+      "profile": "native-index-page-diagnostic-v1"
+    },
+    {
+      "pair": 1,
+      "variant": "control",
+      "instrumentation": false,
+      "memory_limit_bytes": 268435456,
+      "observations": [
+        {
+          "case": "all_qualify",
+          "fixture_rows": 1000,
+          "median_us": 539.321,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            540.8430000000001,
+            535.393,
+            538.349,
+            549.339,
+            539.321,
+            555.9010000000001,
+            534.702
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 1000,
+          "median_us": 541.855,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            544.36,
+            542.086,
+            541.6550000000001,
+            538.89,
+            541.855,
+            538.519,
+            615.834
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 1000,
+          "median_us": 63.298,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            64.812,
+            90.399,
+            73.607,
+            58.479,
+            58.5,
+            58.46,
+            63.298
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 1000,
+          "median_us": 60.844,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            60.844,
+            61.014,
+            61.004,
+            60.714,
+            61.014,
+            60.794000000000004,
+            60.574
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 10000,
+          "median_us": 5645.286999999999,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            5860.139999999999,
+            5785.49,
+            5746.127,
+            5645.286999999999,
+            5628.807000000001,
+            5601.846,
+            5559.877
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 10000,
+          "median_us": 5529.28,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            5529.28,
+            5539.849999999999,
+            5529.04,
+            5519.381,
+            5511.397,
+            5557.723,
+            5538.227
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 10000,
+          "median_us": 58.650000000000006,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            58.91,
+            58.650000000000006,
+            58.480000000000004,
+            58.699999999999996,
+            58.68,
+            58.529,
+            58.46
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 10000,
+          "median_us": 59.832,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            64.83200000000001,
+            60.423,
+            59.972,
+            59.832,
+            59.382000000000005,
+            59.732,
+            59.792
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 100000,
+          "median_us": 60192.521,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            63547.65800000001,
+            60590.367,
+            59616.693,
+            60192.521,
+            59913.840000000004,
+            59653.271,
+            60274.936
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 100000,
+          "median_us": 59349.481,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            60963.045,
+            60568.726,
+            60324.87,
+            59349.481,
+            58720.824,
+            58614.455,
+            58924.425
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 100000,
+          "median_us": 58.839999999999996,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            59.071,
+            58.72,
+            58.64,
+            58.82,
+            58.940000000000005,
+            59.131,
+            58.839999999999996
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 100000,
+          "median_us": 59.482,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            59.482,
+            59.571000000000005,
+            59.892,
+            59.241,
+            59.522,
+            59.471000000000004,
+            59.151
+          ]
+        }
+      ],
+      "profile": "native-index-page-diagnostic-v1"
+    },
+    {
+      "pair": 1,
+      "variant": "head",
+      "instrumentation": false,
+      "memory_limit_bytes": 268435456,
+      "observations": [
+        {
+          "case": "all_qualify",
+          "fixture_rows": 1000,
+          "median_us": 48.980999999999995,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            49.221999999999994,
+            49.783,
+            49.653,
+            48.980999999999995,
+            48.741,
+            48.690999999999995,
+            48.891999999999996
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 1000,
+          "median_us": 50.805,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            50.895,
+            50.915000000000006,
+            50.645,
+            50.805,
+            50.054,
+            54.282,
+            50.344
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 1000,
+          "median_us": 55.223000000000006,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            55.494,
+            55.223000000000006,
+            54.933,
+            54.933,
+            54.812999999999995,
+            55.224,
+            55.284
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 1000,
+          "median_us": 56.746,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            60.202,
+            56.797,
+            56.925999999999995,
+            56.635999999999996,
+            56.666000000000004,
+            56.586000000000006,
+            56.746
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 10000,
+          "median_us": 39.575,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            39.575,
+            39.583999999999996,
+            39.544,
+            39.634,
+            39.705,
+            39.544,
+            39.153999999999996
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 10000,
+          "median_us": 40.717000000000006,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            40.717000000000006,
+            40.486,
+            40.586,
+            40.846999999999994,
+            41.157,
+            40.746,
+            40.506
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 10000,
+          "median_us": 55.594,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            55.564,
+            55.364,
+            55.614,
+            55.524,
+            55.754999999999995,
+            55.594,
+            56.025
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 10000,
+          "median_us": 57.247,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            61.846000000000004,
+            56.925999999999995,
+            57.027,
+            57.247,
+            56.836000000000006,
+            57.678,
+            57.277
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 100000,
+          "median_us": 41.749,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            41.518,
+            41.749,
+            41.758,
+            41.557,
+            41.608,
+            42.239,
+            41.779
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 100000,
+          "median_us": 42.991,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            42.84,
+            42.991,
+            47.98,
+            42.911,
+            43.402,
+            43.101,
+            42.921
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 100000,
+          "median_us": 56.255,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            56.666000000000004,
+            55.854,
+            56.255,
+            56.305,
+            55.834,
+            56.315,
+            55.975
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 100000,
+          "median_us": 57.268,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            57.217,
+            57.268,
+            57.518,
+            57.187,
+            57.257,
+            57.467999999999996,
+            57.868
+          ]
+        }
+      ],
+      "profile": "native-index-page-diagnostic-v1"
+    },
+    {
+      "pair": 2,
+      "variant": "control",
+      "instrumentation": false,
+      "memory_limit_bytes": 268435456,
+      "observations": [
+        {
+          "case": "all_qualify",
+          "fixture_rows": 1000,
+          "median_us": 530.133,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            525.394,
+            531.155,
+            539.501,
+            533.069,
+            527.5590000000001,
+            530.133,
+            527.268
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 1000,
+          "median_us": 529.322,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            538.539,
+            530.4040000000001,
+            530.274,
+            526.326,
+            529.322,
+            523.37,
+            528.18
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 1000,
+          "median_us": 57.838,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            57.838,
+            57.418,
+            57.849000000000004,
+            58.069,
+            57.618,
+            57.848,
+            57.818
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 1000,
+          "median_us": 59.091,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            59.091,
+            59.271,
+            59.201,
+            58.97,
+            59.301,
+            58.75,
+            58.77
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 10000,
+          "median_us": 5520.664,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            5545.991999999999,
+            5548.165,
+            5561.972,
+            5520.664,
+            5510.726,
+            5497.691,
+            5508.28
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 10000,
+          "median_us": 5449.66,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            5453.108,
+            5449.66,
+            5453.2970000000005,
+            5451.926,
+            5441.946,
+            5440.413,
+            5444.151000000001
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 10000,
+          "median_us": 58.429,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            58.68,
+            62.667,
+            58.399,
+            58.589,
+            58.429,
+            58.219,
+            57.778
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 10000,
+          "median_us": 59.261,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            59.752,
+            59.562000000000005,
+            59.02,
+            59.261,
+            58.81,
+            58.72,
+            62.998
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 100000,
+          "median_us": 59431.305,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            58623.382000000005,
+            59544.727999999996,
+            59431.305,
+            59524.6,
+            59664.140999999996,
+            58325.544,
+            59034.773
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 100000,
+          "median_us": 60108.625,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            59591.846,
+            60108.625,
+            60071.715,
+            60440.835999999996,
+            60388.328,
+            59581.346,
+            60349.436
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 100000,
+          "median_us": 58.309,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            58.479,
+            58.31,
+            58.189,
+            58.248999999999995,
+            63.049,
+            58.309,
+            58.288999999999994
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 100000,
+          "median_us": 59.421,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            59.421,
+            59.412,
+            59.752,
+            63.98,
+            59.551,
+            59.251,
+            58.931000000000004
+          ]
+        }
+      ],
+      "profile": "native-index-page-diagnostic-v1"
+    },
+    {
+      "pair": 2,
+      "variant": "head",
+      "instrumentation": false,
+      "memory_limit_bytes": 268435456,
+      "observations": [
+        {
+          "case": "all_qualify",
+          "fixture_rows": 1000,
+          "median_us": 49.613,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            51.396,
+            51.016,
+            49.492,
+            49.613,
+            49.333,
+            49.431999999999995,
+            49.632999999999996
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 1000,
+          "median_us": 50.815,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            51.205999999999996,
+            50.815,
+            50.524,
+            50.976,
+            55.093,
+            50.695,
+            50.494
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 1000,
+          "median_us": 55.885,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            55.815,
+            55.635,
+            55.875,
+            55.885,
+            55.885,
+            55.915,
+            56.106
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 1000,
+          "median_us": 57.047,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            62.31700000000001,
+            56.606,
+            56.536,
+            62.296,
+            57.047,
+            56.807,
+            57.317
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 10000,
+          "median_us": 40.396,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            40.215,
+            40.396,
+            40.506,
+            40.385,
+            40.406,
+            40.135,
+            47.088
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 10000,
+          "median_us": 50.645,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            51.777,
+            52.418,
+            52.428,
+            50.645,
+            41.337,
+            46.897999999999996,
+            41.036
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 10000,
+          "median_us": 56.857,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            56.326,
+            56.866,
+            61.926,
+            56.766,
+            56.576,
+            56.857,
+            57.197
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 10000,
+          "median_us": 57.788000000000004,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            58.059,
+            57.407000000000004,
+            57.408,
+            57.788000000000004,
+            57.347,
+            57.979,
+            57.888
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 100000,
+          "median_us": 50.834999999999994,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            52.818999999999996,
+            43.422,
+            43.231,
+            57.448,
+            50.834999999999994,
+            44.894,
+            59.370999999999995
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 100000,
+          "median_us": 63.99,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            61.636,
+            63.99,
+            62.10699999999999,
+            60.934000000000005,
+            74.61,
+            71.06299999999999,
+            72.125
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 100000,
+          "median_us": 81.422,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            86.902,
+            81.422,
+            84.67899999999999,
+            80.541,
+            90.38900000000001,
+            64.14,
+            58.159
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 100000,
+          "median_us": 83.676,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            78.377,
+            77.806,
+            83.526,
+            85.7,
+            83.676,
+            90.29899999999999,
+            84.177
+          ]
+        }
+      ],
+      "profile": "native-index-page-diagnostic-v1"
+    },
+    {
+      "pair": 3,
+      "variant": "control",
+      "instrumentation": false,
+      "memory_limit_bytes": 268435456,
+      "observations": [
+        {
+          "case": "all_qualify",
+          "fixture_rows": 1000,
+          "median_us": 600.084,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            586.349,
+            549.038,
+            600.084,
+            543.909,
+            707.706,
+            798.136,
+            821.0780000000001
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 1000,
+          "median_us": 858.618,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            861.174,
+            826.419,
+            858.618,
+            903.934,
+            839.563,
+            813.5939999999999,
+            863.888
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 1000,
+          "median_us": 93.015,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            98.956,
+            97.272,
+            97.512,
+            82.525,
+            93.015,
+            88.286,
+            89.48700000000001
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 1000,
+          "median_us": 93.044,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            91.101,
+            99.908,
+            101.21000000000001,
+            93.044,
+            87.674,
+            92.203,
+            104.836
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 10000,
+          "median_us": 8814.846,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            8272.049,
+            8518.431,
+            9102.415,
+            8944.68,
+            8960.288999999999,
+            8814.846,
+            7975.463000000001
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 10000,
+          "median_us": 8829.162999999999,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            7729.2519999999995,
+            7503.9,
+            8829.162999999999,
+            9268.896999999999,
+            9129.225,
+            8874.137,
+            7730.3240000000005
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 10000,
+          "median_us": 94.848,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            95.57900000000001,
+            91.471,
+            95.29799999999999,
+            92.062,
+            90.06899999999999,
+            94.848,
+            97.483
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 10000,
+          "median_us": 92.013,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            93.075,
+            88.576,
+            82.414,
+            79.829,
+            94.046,
+            95.089,
+            92.013
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 100000,
+          "median_us": 94231.64,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            91997.724,
+            94231.64,
+            86144.82699999999,
+            99800.183,
+            88205.96,
+            94660.925,
+            95564.627
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 100000,
+          "median_us": 95492.703,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            86384.457,
+            97050.141,
+            87780.39199999999,
+            96511.322,
+            95492.703,
+            91592.775,
+            97604.099
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 100000,
+          "median_us": 92.423,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            80.40100000000001,
+            80.25,
+            81.272,
+            92.423,
+            105.398,
+            100.358,
+            98.45400000000001
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 100000,
+          "median_us": 93.52499999999999,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            101.25,
+            100.278,
+            97.753,
+            90.499,
+            89.90799999999999,
+            93.52499999999999,
+            87.854
+          ]
+        }
+      ],
+      "profile": "native-index-page-diagnostic-v1"
+    },
+    {
+      "pair": 3,
+      "variant": "head",
+      "instrumentation": false,
+      "memory_limit_bytes": 268435456,
+      "observations": [
+        {
+          "case": "all_qualify",
+          "fixture_rows": 1000,
+          "median_us": 83.166,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            83.166,
+            78.40599999999999,
+            72.005,
+            82.344,
+            91.44099999999999,
+            84.078,
+            83.536
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 1000,
+          "median_us": 83.777,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            85.98100000000001,
+            86.492,
+            79.78,
+            87.013,
+            83.777,
+            79.83,
+            79.81
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 1000,
+          "median_us": 85.991,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            81.563,
+            91.36099999999999,
+            85.039,
+            156.373,
+            85.991,
+            82.455,
+            91.36099999999999
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 1000,
+          "median_us": 86.422,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            86.422,
+            90.38900000000001,
+            98.083,
+            87.975,
+            80.221,
+            73.618,
+            83.346
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 10000,
+          "median_us": 40.476,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            40.717000000000006,
+            40.406,
+            40.476,
+            40.556000000000004,
+            40.516000000000005,
+            40.156,
+            39.995
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 10000,
+          "median_us": 66.78500000000001,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            41.357,
+            40.787,
+            41.368,
+            66.78500000000001,
+            69.871,
+            69.43,
+            69.099
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 10000,
+          "median_us": 85.771,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            75.402,
+            76.393,
+            79.078,
+            123.03999999999999,
+            86.903,
+            85.771,
+            89.768
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 10000,
+          "median_us": 96.42,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            94.467,
+            97.24300000000001,
+            101.15,
+            96.42,
+            95.929,
+            97.50200000000001,
+            95.419
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 100000,
+          "median_us": 64.009,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            50.083999999999996,
+            56.777,
+            74.89,
+            64.631,
+            64.19,
+            64.009,
+            59.983
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 100000,
+          "median_us": 65.422,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            68.649,
+            65.422,
+            64.751,
+            67.307,
+            65.553,
+            61.074000000000005,
+            65.33300000000001
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 100000,
+          "median_us": 90.87,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            87.103,
+            88.445,
+            86.13199999999999,
+            90.87,
+            92.473,
+            97.303,
+            92.81299999999999
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 100000,
+          "median_us": 93.706,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            93.706,
+            90.77,
+            84.12700000000001,
+            102.041,
+            99.316,
+            92.273,
+            98.354
+          ]
+        }
+      ],
+      "profile": "native-index-page-diagnostic-v1"
+    },
+    {
+      "pair": 4,
+      "variant": "control",
+      "instrumentation": false,
+      "memory_limit_bytes": 268435456,
+      "observations": [
+        {
+          "case": "all_qualify",
+          "fixture_rows": 1000,
+          "median_us": 888.615,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            1007.107,
+            760.3240000000001,
+            830.416,
+            888.615,
+            1863.8120000000001,
+            919.173,
+            869.4590000000001
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 1000,
+          "median_us": 886.381,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            1041.391,
+            880.7710000000001,
+            883.6560000000001,
+            886.381,
+            933.8699999999999,
+            899.786,
+            857.386
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 1000,
+          "median_us": 93.96600000000001,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            84.67899999999999,
+            90.72999999999999,
+            96.14,
+            96.882,
+            100.418,
+            90.049,
+            93.96600000000001
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 1000,
+          "median_us": 96.13000000000001,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            95.529,
+            94.227,
+            96.13000000000001,
+            104.49499999999999,
+            94.607,
+            97.142,
+            98.464
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 10000,
+          "median_us": 8065.602,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            8054.412,
+            6291.889,
+            7263.47,
+            8065.602,
+            9020.602,
+            8327.974,
+            9109.468
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 10000,
+          "median_us": 9229.363000000001,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            8351.297,
+            6955.152,
+            8304.009,
+            9229.363000000001,
+            9289.805999999999,
+            9546.026000000002,
+            9289.986
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 10000,
+          "median_us": 93.365,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            97.202,
+            93.786,
+            171.10000000000002,
+            90.049,
+            89.819,
+            93.365,
+            91.492
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 10000,
+          "median_us": 102.271,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            97.092,
+            99.286,
+            95.238,
+            102.58200000000001,
+            105.69800000000001,
+            107.762,
+            102.271
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 100000,
+          "median_us": 93962.215,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            88825.31,
+            93962.215,
+            92137.807,
+            92179.936,
+            94095.094,
+            94383.525,
+            95398.206
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 100000,
+          "median_us": 95908.913,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            96499.44900000001,
+            91484.312,
+            96082.93800000001,
+            95908.913,
+            93906.911,
+            91649.81199999999,
+            99128.33499999999
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 100000,
+          "median_us": 90.87,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            97.122,
+            90.8,
+            90.87,
+            95.589,
+            88.325,
+            88.53599999999999,
+            91.421
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 100000,
+          "median_us": 100.819,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            98.565,
+            100.819,
+            91.80199999999999,
+            107.491,
+            103.02300000000001,
+            101.961,
+            97.282
+          ]
+        }
+      ],
+      "profile": "native-index-page-diagnostic-v1"
+    },
+    {
+      "pair": 4,
+      "variant": "head",
+      "instrumentation": false,
+      "memory_limit_bytes": 268435456,
+      "observations": [
+        {
+          "case": "all_qualify",
+          "fixture_rows": 1000,
+          "median_us": 79.299,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            80.17,
+            79.59899999999999,
+            73.17699999999999,
+            80.01,
+            72.055,
+            74.319,
+            79.299
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 1000,
+          "median_us": 76.07300000000001,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            86.833,
+            70.372,
+            74.98100000000001,
+            75.952,
+            80.24000000000001,
+            76.07300000000001,
+            80.4
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 1000,
+          "median_us": 91.61200000000001,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            93.836,
+            80.802,
+            85.259,
+            92.644,
+            94.938,
+            91.61200000000001,
+            91.53200000000001
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 1000,
+          "median_us": 92.21300000000001,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            96.45100000000001,
+            92.21300000000001,
+            92.203,
+            84.428,
+            90.55000000000001,
+            93.335,
+            94.09700000000001
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 10000,
+          "median_us": 62.958000000000006,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            62.958000000000006,
+            62.187000000000005,
+            65.79299999999999,
+            58.599,
+            65.713,
+            63.539,
+            60.272999999999996
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 10000,
+          "median_us": 64.07000000000001,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            63.919999999999995,
+            72.135,
+            62.81799999999999,
+            62.206999999999994,
+            64.07000000000001,
+            65.423,
+            69.871
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 10000,
+          "median_us": 97.62299999999999,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            99.537,
+            100.408,
+            86.342,
+            93.004,
+            96.09,
+            97.62299999999999,
+            98.965
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 10000,
+          "median_us": 88.024,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            84.458,
+            87.765,
+            83.527,
+            90.72,
+            88.024,
+            93.516,
+            88.346
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 100000,
+          "median_us": 43.742000000000004,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            43.732,
+            43.922,
+            43.742000000000004,
+            43.491,
+            43.682,
+            50.834999999999994,
+            58.189
+          ]
+        },
+        {
+          "case": "all_qualify",
+          "fixture_rows": 100000,
+          "median_us": 77.686,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            65.743,
+            77.715,
+            85.03999999999999,
+            71.765,
+            76.794,
+            78.477,
+            77.686
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 100000,
+          "median_us": 102.202,
+          "output_rows": 100,
+          "readonly": false,
+          "samples_us": [
+            88.806,
+            95.038,
+            102.202,
+            102.872,
+            100.508,
+            103.414,
+            103.413
+          ]
+        },
+        {
+          "case": "last_100",
+          "fixture_rows": 100000,
+          "median_us": 94.086,
+          "output_rows": 100,
+          "readonly": true,
+          "samples_us": [
+            89.678,
+            99.727,
+            94.086,
+            95.609,
+            92.273,
+            95.569,
+            85.89099999999999
+          ]
+        }
+      ],
+      "profile": "native-index-page-diagnostic-v1"
+    }
+  ]
+}
