@@ -12,7 +12,7 @@
 # digest for readability and is what msrv-consistency parses. Refresh both
 # together, deliberately:
 #   docker buildx imagetools inspect rust:1.95-slim-bookworm
-FROM --platform=$BUILDPLATFORM rust:1.95-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082 AS builder
+FROM --platform=$BUILDPLATFORM rust:1.100-slim-bookworm@sha256:7c7d4eb4d05b7781187a327809466cfddf29753f6defdc3d19a0e291951b7a37 AS builder
 
 WORKDIR /src
 
