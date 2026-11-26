@@ -1,13 +1,13 @@
 //! Cold buffered-page schedule for a quiescent heap file.
 //!
-//! Non-shipping bench code. It does not change production reads. Each cold
+//! Probe of the opt-in storage batch reader; default point reads are unchanged. Each cold
 //! sample drops this file from the kernel page cache with `posix_fadvise`
 //! (`POSIX_FADV_DONTNEED`) and then reads through [`DiskManager`], which is a
 //! synchronous `pread`. The heap is not reopened after eviction: heap open
 //! scans every page and would warm the cache before the timer starts.
 //!
 //! There is no `io_uring` or `O_DIRECT` path in the engine. Queue depth here
-//! is several threads calling `pread` on one shared file, which is the honest
+//! uses the storage library to run scoped threads calling `pread` on one file, the
 //! scheduling comparison available on 2026-11-26.
 //!
 //! ```text
@@ -24,11 +24,10 @@ use std::error::Error;
 use std::fs::File;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use powdb_query::executor::Engine;
-use powdb_storage::disk::DiskManager;
+use powdb_storage::disk::{read_pages_verified, DiskManager};
 use powdb_storage::page::{Page, PAGE_SIZE};
 use powdb_storage::types::Value;
 use serde_json::{json, Value as Json};
@@ -148,14 +147,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let report = json!({
         "profile": "cold-buffered-page-schedule-v1",
         "measured_on": "2026-11-26",
-        "production_integration": false,
+        "production_integration": true,
         "cold_nvme_claim": "scoped to this workstation, this file, and buffered pread",
         "method": {
             "eviction": "posix_fadvise POSIX_FADV_DONTNEED on the heap inode before each cold sample",
             "drop_caches": false,
             "o_direct": false,
             "io_uring": false,
-            "queue_depth": "N threads issuing DiskManager::read_page (pread) on one file",
+            "queue_depth": "depth 1: serial DiskManager::read_page; depth >1: powdb_storage::disk::read_pages_verified",
             "heap_reopened_after_eviction": false,
             "checksum": "Page::from_bytes_verified on every fetched page",
             "why_not_heap_open": "HeapFile::open reads every page while discovering free space",
@@ -268,38 +267,17 @@ fn measure(job: Measure<'_>) -> io::Result<Json> {
 }
 
 fn read_pages(disk: &DiskManager, pages: &[u32], depth: usize) -> io::Result<u64> {
-    if depth <= 1 || pages.len() <= 1 {
+    if depth <= 1 {
         let mut sum = 0u64;
         for &page_id in pages {
             sum = sum.wrapping_add(consume_page(disk, page_id)?);
         }
         return Ok(sum);
     }
-    let depth = depth.min(pages.len());
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        let mut joins = Vec::with_capacity(depth);
-        for _ in 0..depth {
-            joins.push(scope.spawn(|| -> io::Result<u64> {
-                let mut sum = 0u64;
-                loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    if index >= pages.len() {
-                        return Ok(sum);
-                    }
-                    sum = sum.wrapping_add(consume_page(disk, pages[index])?);
-                }
-            }));
-        }
-        let mut sum = 0u64;
-        for join in joins {
-            let partial = join
-                .join()
-                .map_err(|_| io::Error::other("page reader thread panicked"))??;
-            sum = sum.wrapping_add(partial);
-        }
-        Ok(sum)
-    })
+    let verified = read_pages_verified(disk, pages, depth)?;
+    Ok(verified
+        .iter()
+        .fold(0u64, |sum, bytes| sum.wrapping_add(fingerprint(bytes))))
 }
 
 fn consume_page(disk: &DiskManager, page_id: u32) -> io::Result<u64> {

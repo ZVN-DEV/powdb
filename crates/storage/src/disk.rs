@@ -1,4 +1,4 @@
-use crate::page::PAGE_SIZE;
+use crate::page::{Page, PAGE_SIZE};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
@@ -225,6 +225,81 @@ impl DiskManager {
     }
 }
 
+/// Read and verify every requested page, preserving request order and duplicates.
+///
+/// `depth` must be nonzero. Depth one is a serial loop; higher depths use at
+/// most `depth` scoped threads sharing the positioned-I/O disk handle. This is
+/// opt-in and does not change [`DiskManager::read_page`] or heap point reads.
+/// Checksums follow [`Page::from_bytes_verified`]'s validate-if-present policy.
+/// Any read, verification, or worker error fails the whole batch. No partial
+/// output is returned. Callers must keep the underlying file quiescent if they
+/// need the batch to represent one consistent snapshot.
+pub fn read_pages_verified(
+    disk: &DiskManager,
+    page_ids: &[u32],
+    depth: usize,
+) -> io::Result<Vec<[u8; PAGE_SIZE]>> {
+    read_pages_with(page_ids, depth, &|page_id| {
+        let bytes = disk.read_page(page_id)?;
+        Page::from_bytes_verified(&bytes).map_err(io::Error::from)?;
+        Ok(bytes)
+    })
+}
+
+// The reader seam lets tests count actual calls, including repeated ids, without
+// adding counters or branches to DiskManager's one-page path.
+fn read_pages_with(
+    page_ids: &[u32],
+    depth: usize,
+    read: &(impl Fn(u32) -> io::Result<[u8; PAGE_SIZE]> + Sync),
+) -> io::Result<Vec<[u8; PAGE_SIZE]>> {
+    if depth == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "page read depth must be nonzero",
+        ));
+    }
+    if depth == 1 {
+        let mut pages = Vec::with_capacity(page_ids.len());
+        for &page_id in page_ids {
+            pages.push(read(page_id)?);
+        }
+        return Ok(pages);
+    }
+    if page_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut pages = vec![[0; PAGE_SIZE]; page_ids.len()];
+    let chunk_size = page_ids.len().div_ceil(depth.min(page_ids.len()));
+    std::thread::scope(|scope| {
+        let mut joins = Vec::new();
+        for (ids, output) in page_ids
+            .chunks(chunk_size)
+            .zip(pages.chunks_mut(chunk_size))
+        {
+            joins.push(scope.spawn(move || -> io::Result<()> {
+                for (&page_id, slot) in ids.iter().zip(output) {
+                    *slot = read(page_id)?;
+                }
+                Ok(())
+            }));
+        }
+        // Join every worker even on error so no unjoined panic escapes scope.
+        let mut result = Ok(());
+        for join in joins {
+            let worker = join
+                .join()
+                .map_err(|_| io::Error::other("page reader thread panicked"))
+                .and_then(|result| result);
+            if result.is_ok() {
+                result = worker;
+            }
+        }
+        result
+    })?;
+    Ok(pages)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +308,71 @@ mod tests {
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("powdb_test_{name}_{}", std::process::id()))
+    }
+
+    fn batch_fixture() -> (tempfile::TempDir, DiskManager) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut disk = DiskManager::create(&dir.path().join("batch.heap")).unwrap();
+        for _ in 0..9 {
+            let id = disk.allocate_page().unwrap();
+            let mut page = Page::new(id, PageType::Data);
+            page.insert(&id.to_le_bytes()).unwrap();
+            page.stamp_checksum();
+            disk.write_page(id, page.as_bytes()).unwrap();
+        }
+        (dir, disk)
+    }
+
+    #[test]
+    fn batch_preserves_serial_order_at_depth_one_and_four() {
+        let (_dir, disk) = batch_fixture();
+        let ids = [8, 0, 5, 2, 1, 7, 3, 6, 4, 0, 8];
+        let expected: Vec<_> = ids.iter().map(|&id| disk.read_page(id).unwrap()).collect();
+        for depth in [1, 4, 100] {
+            assert_eq!(read_pages_verified(&disk, &ids, depth).unwrap(), expected);
+            assert!(read_pages_verified(&disk, &[], depth).unwrap().is_empty());
+        }
+        assert_eq!(
+            read_pages_verified(&disk, &ids, 0).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn batch_refuses_corrupt_or_missing_pages() {
+        let (_dir, mut disk) = batch_fixture();
+        let mut bytes = disk.read_page(2).unwrap();
+        bytes[100] ^= 1;
+        disk.write_page(2, &bytes).unwrap();
+        for depth in [1, 4] {
+            assert!(read_pages_verified(&disk, &[0, 2, 1], depth).is_err());
+            assert_eq!(
+                read_pages_verified(&disk, &[0, 99, 1], depth)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        }
+    }
+
+    #[test]
+    fn batch_reads_duplicate_ids_for_every_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_dir, disk) = batch_fixture();
+        let ids = [2, 2, 0, 2, 0, 2, 0];
+        for depth in [1, 4] {
+            let calls: [_; 9] = std::array::from_fn(|_| AtomicUsize::new(0));
+            let pages = read_pages_with(&ids, depth, &|id| {
+                calls[id as usize].fetch_add(1, Ordering::Relaxed);
+                let bytes = disk.read_page(id)?;
+                Page::from_bytes_verified(&bytes).map_err(io::Error::from)?;
+                Ok(bytes)
+            })
+            .unwrap();
+            assert_eq!(pages.len(), ids.len());
+            assert_eq!(calls[2].load(Ordering::Relaxed), 4);
+            assert_eq!(calls[0].load(Ordering::Relaxed), 3);
+        }
     }
 
     #[test]
