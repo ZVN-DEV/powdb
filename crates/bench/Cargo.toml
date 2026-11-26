@@ -90,6 +90,12 @@ name = "page-gather-probe"
 path = "src/bin/page_gather_probe.rs"
 test = true
 
+# Cold buffered-page schedule. Not part of the criterion gate. Release only.
+[[bin]]
+name = "cold-page-probe"
+path = "src/bin/cold_page_probe.rs"
+test = true
+
 [[bench]]
 name = "powql"
 harness = false
