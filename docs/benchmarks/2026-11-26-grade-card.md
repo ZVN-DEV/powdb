@@ -14,6 +14,20 @@ The 26 November cold run is the evidence under the 7.5. It is buffered `pread` o
 | I1 Integrity | Every timed call in the 26 November JSON matched its page fingerprint. CRC checked on the way in | Stays perfect. A flipped byte in a fetched page must be refused. Order, duplicates, and missing slots match | Any mismatched value. Speed does not offset this |
 | P1 Single page | `HeapFile::get` and `DiskManager::read_page` are one synchronous `pread` | Default one-page reads stay on that path. Existing storage tests pass | A batch scheduler that makes a point read wait on a thread pool |
 
+## Ext4 library run, same day
+
+`read_pages_verified` is opt-in. Point reads still use `DiskManager::read_page`. Evidence: `docs/benchmarks/2026-11-26-library-batch.json`, on ext4 `nvme0n1`, commit `298ea05` on `bench/cold-page-reads`.
+
+| Id | Result | 9.2 |
+| --- | --- | --- |
+| R1 | Depth 1 median 137.6 ms. Depth 16 median 16.3 ms (8.45×). Device bytes 4.9% to 6.4% over 16 MiB. Fingerprints matched. | Met |
+| F1 | Serial reread 4.7 ms, one pass 1.1 ms (23% of the reread). Both moved 192,512 device bytes. | Met |
+| S1 | Cold 26.8 ms, warm 21.2 ms, ratio 1.26. Device bytes equal the 64 MiB file. Warm is under 21.4 ms. | Not met. The ratio is just over 1.25. Do not retune for that gap. |
+| I1 | Every timed call matched. A corrupt page is refused in `batch_refuses_corrupt_or_missing_pages`. | Holds on this run |
+| P1 | Batch depth is chosen by the caller. `read_page` is unchanged. | Holds |
+
+The assigned blind grade stays 7.5 until every bar is met on one run and the batch path is actually used by a production fetch of many known pages. R1's 9.2 number is the library, not a query plan.
+
 ## Rules for the push
 
 - Side branch only. Do not merge to `main` and do not push unless Kirby asks.
