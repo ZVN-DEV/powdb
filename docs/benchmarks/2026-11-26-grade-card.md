@@ -26,7 +26,7 @@ The 26 November cold run is the evidence under the 7.5. It is buffered `pread` o
 | I1 | Every timed call matched. A corrupt page is refused in `batch_refuses_corrupt_or_missing_pages`. | Holds on this run |
 | P1 | Batch depth is chosen by the caller. `read_page` is unchanged. | Holds |
 
-The assigned blind grade stays 7.5 until every bar is met on one run and the batch path is actually used by a production fetch of many known pages. R1's 9.2 number is the library, not a query plan.
+The assigned blind grade stays 7.5 until every bar is met on one run. Non-unique range scans in `Engine::dispatch_mut` now call `Table::get_many` (depth 16, chunks of 4096) when more than one row id is known. A single row still uses `Table::get`. Unique equality, the read-only server path, and `try_bounded_index_page` are unchanged. Equivalence tests passed. That wiring is not itself a new cold timing.
 
 ## Rules for the push
 

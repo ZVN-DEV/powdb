@@ -1508,6 +1508,30 @@ impl Table {
         Ok(Some(decode_row(&self.schema, &data)))
     }
 
+    /// Read many rows in request order. Disk pages are fetched together.
+    /// A v2 row still reassembles each overflow chain, one chain at a time.
+    pub fn get_many(&self, rids: &[RowId], depth: usize) -> io::Result<Vec<Option<Row>>> {
+        let raw = self.heap.get_many(rids, depth)?;
+        let mut rows = Vec::with_capacity(raw.len());
+        for data in raw {
+            let Some(data) = data else {
+                rows.push(None);
+                continue;
+            };
+            if crate::row::row_is_v2(&data) {
+                rows.push(Some(crate::row::decode_row_v2(
+                    &self.schema,
+                    &self.row_layout,
+                    &data,
+                    |stub| self.heap.read_overflow_value(stub).map_err(io::Error::from),
+                )?));
+            } else {
+                rows.push(Some(decode_row(&self.schema, &data)));
+            }
+        }
+        Ok(rows)
+    }
+
     /// Read only the requested logical columns from one row.
     ///
     /// Output order exactly follows `column_indices`, including duplicates.

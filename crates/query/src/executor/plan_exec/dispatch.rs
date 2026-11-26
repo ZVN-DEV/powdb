@@ -2465,22 +2465,31 @@ impl Engine {
                             let rids = btree.range_rids(start_val.as_ref(), end_val.as_ref());
                             let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
                             let mut cancel = CancelCheck::new();
-                            for rid in rids {
-                                cancel.tick()?;
-                                // Overflow safety (P0-3): reassemble spilled cols.
-                                if let Some(row) =
-                                    tbl.get(rid).map_err(QueryError::from_storage_io)?
-                                {
-                                    if !row[col_idx].is_empty()
-                                        && range_matches(
-                                            &row[col_idx],
-                                            &start_val,
-                                            start_inclusive,
-                                            &end_val,
-                                            end_inclusive,
-                                        )
-                                    {
-                                        rows.push(row);
+                            // Page ids are known. Fetch disk pages in a batch.
+                            // Depth 16 is the measured cold-random depth. One
+                            // row still goes through the ordinary point read.
+                            for chunk in rids.chunks(4_096) {
+                                let fetched = if chunk.len() == 1 {
+                                    vec![tbl.get(chunk[0]).map_err(QueryError::from_storage_io)?]
+                                } else {
+                                    tbl.get_many(chunk, 16)
+                                        .map_err(QueryError::from_storage_io)?
+                                };
+                                for row in fetched {
+                                    cancel.tick()?;
+                                    // Overflow safety (P0-3): reassemble spilled cols.
+                                    if let Some(row) = row {
+                                        if !row[col_idx].is_empty()
+                                            && range_matches(
+                                                &row[col_idx],
+                                                &start_val,
+                                                start_inclusive,
+                                                &end_val,
+                                                end_inclusive,
+                                            )
+                                        {
+                                            rows.push(row);
+                                        }
                                     }
                                 }
                             }

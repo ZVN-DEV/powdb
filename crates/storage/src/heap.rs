@@ -1,4 +1,4 @@
-use crate::disk::DiskManager;
+use crate::disk::{read_pages_verified, DiskManager};
 use crate::error::StorageError;
 use crate::page::{
     iter_page_slots, verify_page_layout_bytes, Page, PageType, UpdateFit, MAX_ROW_DATA_SIZE,
@@ -1639,6 +1639,73 @@ impl HeapFile {
         }
     }
 
+    /// Read many rows, preserving order and duplicate ids.
+    ///
+    /// Pages already in the hot slot or the dirty buffer are taken from
+    /// memory, same as [`Self::get`]. The rest are read with
+    /// [`read_pages_verified`] at `depth` (clamped to 1 when only a handful
+    /// of disk pages are needed). Overflow chains are not followed here.
+    /// The caller decodes them, as [`crate::table::Table::get`] does.
+    pub fn get_many(&self, rids: &[RowId], depth: usize) -> io::Result<Vec<Option<Vec<u8>>>> {
+        if rids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut needed = Vec::new();
+        let mut seen = FxHashMap::default();
+        for rid in rids {
+            if self.page_in_memory(rid.page_id) || rid.page_id >= self.disk.num_pages() {
+                continue;
+            }
+            if seen.insert(rid.page_id, ()).is_none() {
+                needed.push(rid.page_id);
+            }
+        }
+        let depth = if needed.len() < 8 { 1 } else { depth.max(1) };
+        let fetched = if needed.is_empty() {
+            Vec::new()
+        } else {
+            read_pages_verified(&self.disk, &needed, depth)?
+        };
+        let mut by_id: FxHashMap<u32, [u8; PAGE_SIZE]> = FxHashMap::default();
+        for (page_id, bytes) in needed.into_iter().zip(fetched) {
+            by_id.insert(page_id, bytes);
+        }
+        let mut out = Vec::with_capacity(rids.len());
+        for &rid in rids {
+            if self.page_in_memory(rid.page_id)
+                || rid.page_id >= self.disk.num_pages()
+                || !by_id.contains_key(&rid.page_id)
+            {
+                out.push(self.get(rid)?);
+                continue;
+            }
+            let bytes = &by_id[&rid.page_id];
+            // `read_pages_verified` already ran the CRC. `from_bytes` only
+            // rebuilds the page so the slot can be copied.
+            let page = Page::from_bytes(bytes).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "verified page bytes would not parse",
+                )
+            })?;
+            match page.get(rid.slot_index) {
+                Some(row) => {
+                    validate_row_format(row)?;
+                    out.push(Some(row.to_vec()));
+                }
+                None => out.push(None),
+            }
+        }
+        Ok(out)
+    }
+
+    fn page_in_memory(&self, page_id: u32) -> bool {
+        self.hot_page
+            .as_ref()
+            .is_some_and(|hot| hot.page_id == page_id)
+            || self.dirty_buffer.contains_key(&page_id)
+    }
+
     /// Delete a row by marking its slot as deleted.
     ///
     /// Mission C Phase 1: land the change on the hot page so back-to-back
@@ -2847,6 +2914,29 @@ mod tests {
         let path = std::env::temp_dir().join(format!("powdb_heap_{name}_{}", std::process::id()));
         let heap = HeapFile::create(&path).unwrap();
         (heap, path)
+    }
+
+    #[test]
+    fn get_many_matches_point_reads_for_order_duplicates_and_holes() {
+        let (mut heap, path) = temp_heap("get_many_match");
+        let schema = user_schema();
+        let mut rids = Vec::new();
+        for i in 0..40 {
+            let row = encode_row(&schema, &[Value::Str(format!("{:080}", i)), Value::Int(i)]);
+            rids.push(heap.insert(&row).unwrap());
+        }
+        heap.delete(rids[2]).unwrap();
+        let query = vec![rids[7], rids[2], rids[7], rids[0], rids[39]];
+        for depth in [1_usize, 16] {
+            let many = heap.get_many(&query, depth).unwrap();
+            assert_eq!(many.len(), query.len());
+            for (rid, got) in query.iter().zip(many) {
+                assert_eq!(got, heap.get(*rid).unwrap());
+            }
+        }
+        assert!(heap.get_many(&[], 16).unwrap().is_empty());
+        drop(heap);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
