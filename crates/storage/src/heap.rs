@@ -1666,9 +1666,11 @@ impl HeapFile {
         } else {
             read_pages_verified(&self.disk, &needed, depth)?
         };
-        let mut by_id: FxHashMap<u32, [u8; PAGE_SIZE]> = FxHashMap::default();
-        for (page_id, bytes) in needed.into_iter().zip(fetched) {
-            by_id.insert(page_id, bytes);
+        // Indexes into `fetched`. Moving each `[u8; PAGE_SIZE]` into the map
+        // would copy 4 KiB per page; the batch vec already owns the bytes.
+        let mut by_id: FxHashMap<u32, usize> = FxHashMap::default();
+        for (index, &page_id) in needed.iter().enumerate() {
+            by_id.insert(page_id, index);
         }
         let mut out = Vec::with_capacity(rids.len());
         for &rid in rids {
@@ -1679,7 +1681,7 @@ impl HeapFile {
                 out.push(self.get(rid)?);
                 continue;
             }
-            let bytes = &by_id[&rid.page_id];
+            let bytes = &fetched[by_id[&rid.page_id]];
             // `read_pages_verified` already ran the CRC. Same slot read as
             // the mmap point-read: the count check, then the row bytes,
             // with no `Page` copy. `slot_bytes_from_page` does not check
