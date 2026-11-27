@@ -96,7 +96,7 @@ fn all_null_constant_group_preserves_empty_aggregate_values() {
 }
 
 #[test]
-fn spilled_bodies_use_generic_fallback_without_losing_aggregate_rows() {
+fn spilled_bodies_keep_constant_group_aggregates() {
     for body_bytes in [10_000, 70_000] {
         let (_dir, mut engine) = fixture(0);
         engine
@@ -122,10 +122,10 @@ fn spilled_bodies_use_generic_fallback_without_losing_aggregate_rows() {
         engine.reset_forced_generic_sites();
         assert_eq!(result_rows(engine.execute_powql(QUERY).unwrap()), expected);
         assert!(
-            !engine
+            engine
                 .forced_generic_sites()
                 .contains(&"aggregate:stream-constant-group"),
-            "overflow must decline before entering the streaming path"
+            "overflow constant-group must reach the streaming gate, not bail first"
         );
         engine.set_force_generic_path(false);
         assert_eq!(result_rows(engine.execute_powql(QUERY).unwrap()), expected);

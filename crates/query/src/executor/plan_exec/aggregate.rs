@@ -32,11 +32,6 @@ impl crate::executor::Engine {
         if self.view_registry.is_dirty(table) {
             return Ok(None);
         }
-        // The raw visitor rehydrates spilled rows through the legacy row
-        // encoder. Use the strict generic scan for overflow tables instead.
-        if self.catalog.table_has_overflow(table) {
-            return Ok(None);
-        }
         if keys.len() != 1 || !matches!(keys[0].expr, Expr::Literal(Literal::Int(_))) {
             return Ok(None);
         }
@@ -116,8 +111,13 @@ impl crate::executor::Engine {
         let mut seen = false;
         let mut error = None;
         let mut cancel = CancelCheck::new();
+        // Raw slots, not `try_for_each_row_raw`. That visitor rehydrates every
+        // spill and skips a value that cannot re-inline (>= 64KB), which
+        // undercounts. This fold only reads fixed columns. `decode_column`
+        // applies the v2 overflow-bitmap shift and does not fetch a chain.
         self.catalog
-            .try_for_each_row_raw(table, |_rid, data| {
+            .try_for_each_on_disk_row(table, |_rid, slot| {
+                let data = slot.bytes();
                 #[cfg(feature = "testing")]
                 crate::executor::work_stats::record_seq_row();
                 if let Err(err) = cancel.tick() {
