@@ -154,7 +154,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "drop_caches": false,
             "o_direct": false,
             "io_uring": false,
-            "queue_depth": "depth 1: serial DiskManager::read_page; depth >1: powdb_storage::disk::read_pages_verified",
+            "queue_depth": "sequential_distinct at every depth, including depth 1: powdb_storage::disk::read_pages_verified (one pread per contiguous run). random_distinct depth 1, fanout_serial_reread, and fanout_packet: serial DiskManager::read_page. random_distinct depth >1: read_pages_verified",
             "heap_reopened_after_eviction": false,
             "checksum": "Page::from_bytes_verified on every fetched page",
             "why_not_heap_open": "HeapFile::open reads every page while discovering free space",
@@ -208,6 +208,11 @@ fn measure(job: Measure<'_>) -> io::Result<Json> {
         samples,
     } = job;
     let expected = fingerprint_sum(fingerprints, pages);
+    // Sequential pages are 0..n. Depth 1 of that case has to use the
+    // coalesced reader or S1 times the one-pread path the change did not touch.
+    // Random depth 1 and both fanout cases stay on read_page so R1's 4×
+    // baseline and F1's serial reread stay one pread per request.
+    let coalesce = name == "sequential_distinct" || depth > 1;
     let distinct = {
         let mut ids = pages.to_vec();
         ids.sort_unstable();
@@ -224,7 +229,7 @@ fn measure(job: Measure<'_>) -> io::Result<Json> {
         let before_proc = physical_read_bytes();
         let before_device = disk_read_bytes();
         let start = Instant::now();
-        let got = read_pages(disk, pages, depth)?;
+        let got = read_pages(disk, pages, depth, coalesce)?;
         let elapsed_us = start.elapsed().as_secs_f64() * 1e6;
         let after_proc = physical_read_bytes();
         let after_device = disk_read_bytes();
@@ -251,6 +256,7 @@ fn measure(job: Measure<'_>) -> io::Result<Json> {
     Ok(json!({
         "case": name,
         "queue_depth": depth,
+        "reader": if coalesce { "read_pages_verified" } else { "read_page" },
         "cold": cold,
         "requested_reads": pages.len(),
         "distinct_pages": distinct,
@@ -266,8 +272,8 @@ fn measure(job: Measure<'_>) -> io::Result<Json> {
     }))
 }
 
-fn read_pages(disk: &DiskManager, pages: &[u32], depth: usize) -> io::Result<u64> {
-    if depth <= 1 {
+fn read_pages(disk: &DiskManager, pages: &[u32], depth: usize, coalesce: bool) -> io::Result<u64> {
+    if depth <= 1 && !coalesce {
         let mut sum = 0u64;
         for &page_id in pages {
             sum = sum.wrapping_add(consume_page(disk, page_id)?);
@@ -496,7 +502,9 @@ mod tests {
         let pages: Vec<u32> = (0..disk.num_pages()).collect();
         let expected = fingerprint_sum(&fingerprints, &pages);
         evict_cache(&heap_path).expect("evict");
-        let got = read_pages(&disk, &pages, 2).expect("read");
+        let got = read_pages(&disk, &pages, 2, true).expect("read");
         assert_eq!(got, expected);
+        let coalesced = read_pages(&disk, &pages, 1, true).expect("coalesced depth 1");
+        assert_eq!(coalesced, expected);
     }
 }
