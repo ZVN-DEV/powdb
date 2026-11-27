@@ -168,47 +168,56 @@ impl Engine {
         let path_expr = stored_json_path_expr(path);
         let mut rows = Vec::with_capacity(rids.len());
         let mut cancel = CancelCheck::new();
-        for rid in rids {
-            cancel.tick()?;
-            match &projection {
-                Some((projected_indices, _)) => {
-                    let mut fetch_indices = projected_indices.clone();
-                    let root_position = fetch_indices.iter().position(|index| *index == root_index);
-                    let root_position = match root_position {
-                        Some(position) => position,
-                        None => {
-                            fetch_indices.push(root_index);
-                            fetch_indices.len() - 1
-                        }
-                    };
-                    let Some(mut fetched) = self
-                        .catalog
-                        .get_projected(table, rid, &fetch_indices)
-                        .map_err(QueryError::from_storage_io)?
-                    else {
-                        continue;
-                    };
-                    if let Some((start, start_inclusive, end, end_inclusive)) = &range {
-                        let value = eval_expr(
-                            &path_expr,
-                            std::slice::from_ref(&fetched[root_position]),
-                            std::slice::from_ref(&path.column),
-                        );
-                        if value.is_empty()
-                            || !range_matches(&value, start, *start_inclusive, end, *end_inclusive)
-                        {
-                            continue;
-                        }
+        if let Some((projected_indices, _)) = &projection {
+            for rid in rids {
+                cancel.tick()?;
+                let mut fetch_indices = projected_indices.clone();
+                let root_position = fetch_indices.iter().position(|index| *index == root_index);
+                let root_position = match root_position {
+                    Some(position) => position,
+                    None => {
+                        fetch_indices.push(root_index);
+                        fetch_indices.len() - 1
                     }
-                    fetched.truncate(projected_indices.len());
-                    rows.push(fetched);
+                };
+                let Some(mut fetched) = self
+                    .catalog
+                    .get_projected(table, rid, &fetch_indices)
+                    .map_err(QueryError::from_storage_io)?
+                else {
+                    continue;
+                };
+                if let Some((start, start_inclusive, end, end_inclusive)) = &range {
+                    let value = eval_expr(
+                        &path_expr,
+                        std::slice::from_ref(&fetched[root_position]),
+                        std::slice::from_ref(&path.column),
+                    );
+                    if value.is_empty()
+                        || !range_matches(&value, start, *start_inclusive, end, *end_inclusive)
+                    {
+                        continue;
+                    }
                 }
-                None => {
-                    let Some(row) = self
-                        .catalog
-                        .get(table, rid)
+                fetched.truncate(projected_indices.len());
+                rows.push(fetched);
+            }
+        } else if let Some(tbl) = self.catalog.get_table(table) {
+            // Page ids are known. Fetch disk pages in a batch.
+            // Depth 16 is the measured cold-random depth. One
+            // row still goes through the ordinary point read.
+            for chunk in rids.chunks(4_096) {
+                for _ in chunk {
+                    cancel.tick()?;
+                }
+                let fetched = if chunk.len() == 1 {
+                    vec![tbl.get(chunk[0]).map_err(QueryError::from_storage_io)?]
+                } else {
+                    tbl.get_many(chunk, 16)
                         .map_err(QueryError::from_storage_io)?
-                    else {
+                };
+                for row in fetched {
+                    let Some(row) = row else {
                         continue;
                     };
                     if let Some((start, start_inclusive, end, end_inclusive)) = &range {
@@ -221,6 +230,11 @@ impl Engine {
                     }
                     rows.push(row);
                 }
+            }
+        } else {
+            // Missing table: Catalog::get contributes no row. Tick once per rid.
+            for _ in rids {
+                cancel.tick()?;
             }
         }
 
@@ -306,10 +320,10 @@ impl Engine {
             .map(|&index| all_columns[index].clone())
             .collect();
 
-        let mut rows: Vec<Vec<Value>> = Vec::new();
         // Cooperative cancellation: a driving key with many matching rids can
         // fetch a large candidate set, so this loop must stay stoppable.
         let mut cancel = CancelCheck::new();
+        let mut matched = Vec::new();
         for rid in rids {
             cancel.tick()?;
             #[cfg(feature = "testing")]
@@ -322,14 +336,39 @@ impl Engine {
                 continue;
             };
             if eval_predicate(predicate, &sparse, &residual_names) {
+                matched.push(rid);
+            }
+        }
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(matched.len());
+        if let Some(tbl) = self.catalog.get_table(table) {
+            // Full row only after the projected recheck passes. One row stays
+            // on Table::get. Depth 16 matches the other batched heap reads.
+            for chunk in matched.chunks(4_096) {
                 #[cfg(feature = "testing")]
-                crate::executor::work_stats::record_heap_fetch();
-                if let Some(full) = self
-                    .catalog
-                    .get(table, rid)
-                    .map_err(QueryError::from_storage_io)?
                 {
-                    rows.push(full);
+                    for _ in chunk {
+                        crate::executor::work_stats::record_heap_fetch();
+                    }
+                }
+                let fetched = if chunk.len() == 1 {
+                    vec![tbl.get(chunk[0]).map_err(QueryError::from_storage_io)?]
+                } else {
+                    tbl.get_many(chunk, 16)
+                        .map_err(QueryError::from_storage_io)?
+                };
+                for row in fetched {
+                    if let Some(row) = row {
+                        rows.push(row);
+                    }
+                }
+            }
+        } else {
+            // Catalog::get on a missing table contributes no row. Still count
+            // one heap fetch per match, as the per-rid path did.
+            #[cfg(feature = "testing")]
+            {
+                for _ in &matched {
+                    crate::executor::work_stats::record_heap_fetch();
                 }
             }
         }
