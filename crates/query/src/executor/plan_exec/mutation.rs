@@ -270,19 +270,31 @@ impl Engine {
                         let candidates = btree.range_rids(start_val.as_ref(), end_val.as_ref());
                         let mut rids = Vec::with_capacity(candidates.len());
                         let mut cancel = CancelCheck::new();
-                        for rid in candidates {
-                            cancel.tick()?;
-                            if let Some(row) = tbl.get(rid).map_err(QueryError::from_storage_io)? {
-                                if !row[col_idx].is_empty()
-                                    && range_matches(
-                                        &row[col_idx],
-                                        &start_val,
-                                        start_inclusive,
-                                        &end_val,
-                                        end_inclusive,
-                                    )
-                                {
-                                    rids.push(rid);
+                        // Known primary pages. Read a chunk together. One row
+                        // stays a point read. Depth 16 is the cold-random depth.
+                        for chunk in candidates.chunks(4_096) {
+                            for _ in chunk {
+                                cancel.tick()?;
+                            }
+                            let fetched = if chunk.len() == 1 {
+                                vec![tbl.get(chunk[0]).map_err(QueryError::from_storage_io)?]
+                            } else {
+                                tbl.get_many(chunk, 16)
+                                    .map_err(QueryError::from_storage_io)?
+                            };
+                            for (&rid, row) in chunk.iter().zip(fetched) {
+                                if let Some(row) = row {
+                                    if !row[col_idx].is_empty()
+                                        && range_matches(
+                                            &row[col_idx],
+                                            &start_val,
+                                            start_inclusive,
+                                            &end_val,
+                                            end_inclusive,
+                                        )
+                                    {
+                                        rids.push(rid);
+                                    }
                                 }
                             }
                         }
