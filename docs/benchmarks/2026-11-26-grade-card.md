@@ -26,7 +26,7 @@ The 26 November cold run is the evidence under the 7.5. It is buffered `pread` o
 | I1 | Every timed call matched. A corrupt page is refused in `batch_refuses_corrupt_or_missing_pages`. | Holds on this run |
 | P1 | Batch depth is chosen by the caller. `read_page` is unchanged. | Holds |
 
-The assigned blind grade stays 7.5 until every bar is met on one run. S1 is still the miss from the ext4 library run above. Do not retune that ratio.
+The assigned blind grade was 7.5 until every bar held on one release run. That run is below.
 
 ## Readonly unique range, 2026-11-27
 
@@ -44,6 +44,24 @@ Evidence: `docs/benchmarks/2026-11-27-cold-query.json`, ext4 on `nvme0n1`, commi
 Cold median is 40.651 ms. The same machine's library depth-1 random read was 137.6 ms for half this many pages, so a one-pread-per-page walk of this heap would sit near 275 ms. 40.7 ms is the batched path, plus planning and row decode. This shape is every data page in key order, not the R1 sample of 4,096 pages drawn from a larger file, so it does not replace the R1 or S1 rows above. Warm at 0 bytes checks the eviction method. The fixture directory was removed.
 
 Known multi-rid fetches now call `Table::get_many` at depth 16 in chunks of 4,096. One-row chunks stay on `Table::get`. That covers read-only and mutable index lookups, unique range scans, non-unique range scans on both executors, expression-index full rows, residual rows that already passed the projected check, nested index probes, and update/delete discovery. `try_bounded_index_page` is unchanged. Equivalence tests passed (13 and 4). Clippy `-D warnings` passed.
+
+## Ext4 library run after contiguous reads, 2026-11-27
+
+Evidence: `docs/benchmarks/2026-11-27-library-coalesce.json`, ext4 on `nvme0n1`, commit `763c4ba` on `bench/cold-page-reads`. Same probe shape as the earlier library run: 16,384 rows, 64 MiB heap, 7 samples, `posix_fadvise(DONTNEED)`, no `drop_caches`, no `O_DIRECT`. The fixture directory was removed. Every timed call matched its fingerprint. Warm samples moved 0 bytes. Cold sequential samples moved exactly 67,112,960 bytes, the file size.
+
+Depth 1 in this probe is still one `pread` per page (`DiskManager::read_page`). Depths 4, 16, and 32 go through `read_pages_verified`, which now reads a contiguous run in one `pread` and then checks each page. `read_page` itself is unchanged. Storage library tests: 276 passed, 1 ignored.
+
+| Id | Result | 9.2 |
+| --- | --- | --- |
+| R1 | Depth 1 median 137.5 ms. Depth 16 median 15.9 ms (8.67×). Device bytes 4.5% to 5.8% over 16 MiB. | Met |
+| S1 | Cold 22.2 ms, warm 19.7 ms, ratio 1.13. Warm is under 21.4 ms. Device bytes equal the file. | Met |
+| F1 | Serial reread 5.0 ms, one pass 1.0 ms (20% of the reread). Both moved 192,512 process bytes. | Met |
+| I1 | Every timed call matched. A corrupt page is refused in `batch_refuses_corrupt_or_missing_pages`. | Met |
+| P1 | `read_page` is still one pread. The storage library suite passed. | Met |
+
+All five bars held on this run. The read-only unique-range fetch above already showed a production multi-page read using `Table::get_many`, which calls this same verified reader. The assigned grade moves to 9.2.
+
+The earlier ext4 sample missed S1 at ratio 1.26 on the same depth-1 path. This sample of that path is 1.13. Sequential depth 16, which does coalesce, was 21.2 ms, close to depth 1 at 22.2 ms. Kernel readahead already covers sequential 4 KiB reads, so the ratio change is this run's cold and warm pair, not a large change in the depth-1 code.
 
 ## Rules for the push
 
