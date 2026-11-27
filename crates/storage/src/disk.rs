@@ -247,10 +247,10 @@ impl DiskManager {
 /// `run_len * PAGE_SIZE` bytes; a single page stays [`DiskManager::read_page`].
 /// A gap, a duplicate, or a decreasing id is not coalesced. This is opt-in and
 /// does not change [`DiskManager::read_page`] or heap point reads. Checksums
-/// follow [`Page::from_bytes_verified`]'s validate-if-present policy. Any read,
-/// verification, or worker error fails the whole batch. No partial output is
-/// returned. Callers must keep the underlying file quiescent if they need the
-/// batch to represent one consistent snapshot.
+/// follow [`Page::verify_bytes`]'s validate-if-present policy: the check does
+/// not copy the page. Any read, verification, or worker error fails the whole
+/// batch. No partial output is returned. Callers must keep the underlying file
+/// quiescent if they need the batch to represent one consistent snapshot.
 pub fn read_pages_verified(
     disk: &DiskManager,
     page_ids: &[u32],
@@ -339,12 +339,12 @@ fn verify_contiguous_runs(
         filled += run.len();
         if run.len() == 1 {
             let bytes = disk.read_page(start_id)?;
-            Page::from_bytes_verified(&bytes).map_err(io::Error::from)?;
+            Page::verify_bytes(&bytes).map_err(io::Error::from)?;
             slots[0] = bytes;
         } else {
             disk.read_contiguous_into(start_id, slots)?;
             for page in slots.iter() {
-                Page::from_bytes_verified(page).map_err(io::Error::from)?;
+                Page::verify_bytes(page).map_err(io::Error::from)?;
             }
         }
     }
@@ -412,6 +412,8 @@ mod tests {
         disk.write_page(2, &bytes).unwrap();
         for depth in [1, 4] {
             assert!(read_pages_verified(&disk, &[0, 2, 1], depth).is_err());
+            // Page 2 sits in the middle of one contiguous run, not a one-page read.
+            assert!(read_pages_verified(&disk, &[0, 1, 2, 3], depth).is_err());
             assert_eq!(
                 read_pages_verified(&disk, &[0, 99, 1], depth)
                     .unwrap_err()
