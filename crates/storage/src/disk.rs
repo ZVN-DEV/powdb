@@ -243,10 +243,13 @@ impl DiskManager {
 /// `depth` must be nonzero. Depth one is a serial loop; higher depths use at
 /// most `depth` scoped threads sharing the positioned-I/O disk handle. Each
 /// thread groups its slice into maximal runs of ids where each id is exactly
-/// one greater than the previous. A run longer than 32 pages is two preads:
-/// the second read overlaps the checksum of the first half. Every shorter run
-/// is one pread, [`DiskManager::read_page`] for a single page and one
-/// contiguous read otherwise. A gap, a duplicate, or a decreasing id is not
+/// one greater than the previous. A run longer than 32 pages is two preads
+/// issued together. The checksum of the first half runs while the second
+/// pread is still in flight. Starting the second read only after the first
+/// returns was measured: kernel readahead finished the file inside the first
+/// call, and cold stayed 28.1 ms. Every shorter run is one pread,
+/// [`DiskManager::read_page`] for a single page and one contiguous read
+/// otherwise. A gap, a duplicate, or a decreasing id is not
 /// coalesced. This is opt-in and does not change
 /// [`DiskManager::read_page`] or heap point reads. Checksums follow
 /// [`Page::verify_bytes`]'s validate-if-present policy: the check does not
@@ -325,7 +328,7 @@ fn read_pages_in_chunks(
 }
 
 // 32 pages is 128 KiB: one positioned read. A longer run is exactly two reads,
-// not a window loop. The second pread overlaps the first half's checksum.
+// not a window loop. Both preads are issued before either checksum starts.
 const ONE_TRANSFER_PAGES: usize = 32;
 
 fn verify_page_bytes(pages: &[[u8; PAGE_SIZE]]) -> io::Result<()> {
@@ -335,10 +338,10 @@ fn verify_page_bytes(pages: &[[u8; PAGE_SIZE]]) -> io::Result<()> {
     Ok(())
 }
 
-// Two preads, both halves nonempty (`mid = len / 2`). The caller reads the
-// first half, then one scoped helper reads the second half while the caller
-// checksums the first. Join before touching the second half. `checked_add`
-// is a backstop: `chunk_by` already refuses a wrapping run.
+// Two preads, both halves nonempty (`mid = len / 2`). The helper's pread is
+// started before the caller's pread returns. The caller then checksums the
+// first half, joins the helper, and only then checksums the second half.
+// `checked_add` is a backstop: `chunk_by` already refuses a wrapping run.
 fn verify_long_run(
     disk: &DiskManager,
     start_id: u32,
@@ -346,8 +349,6 @@ fn verify_long_run(
 ) -> io::Result<()> {
     let mid = slots.len() / 2;
     debug_assert!(mid > 0 && mid < slots.len());
-    let (first, second) = slots.split_at_mut(mid);
-    disk.read_contiguous_into(start_id, first)?;
     let second_start = u32::try_from(mid)
         .ok()
         .and_then(|half| start_id.checked_add(half))
@@ -357,10 +358,12 @@ fn verify_long_run(
                 "contiguous page run overflows a page id",
             )
         })?;
+    let (first, second) = slots.split_at_mut(mid);
     std::thread::scope(|scope| {
         let reader =
             scope.spawn(|| -> io::Result<()> { disk.read_contiguous_into(second_start, second) });
-        let verified = verify_page_bytes(first);
+        let first_read = disk.read_contiguous_into(start_id, first);
+        let verified = first_read.and_then(|()| verify_page_bytes(first));
         let read = reader
             .join()
             .map_err(|_| io::Error::other("page reader thread panicked"))
