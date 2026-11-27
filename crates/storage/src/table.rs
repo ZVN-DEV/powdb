@@ -94,6 +94,32 @@ pub(crate) struct ExpressionIndexedPath {
     pub btree: BTree,
 }
 
+/// One live heap slot, still in its on-disk encoding, plus a way to read a
+/// spilled value without re-borrowing the table.
+///
+/// Valid only for the duration of one [`Table::try_for_each_on_disk_row`]
+/// callback. v2 bytes stay v2.
+pub struct OnDiskSlot<'a> {
+    bytes: &'a [u8],
+    heap: &'a HeapFile,
+}
+
+impl<'a> OnDiskSlot<'a> {
+    /// Raw slot bytes. A v2 row is not rewritten into v1.
+    #[inline]
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Reassemble one overflow chain. Verifies the page CRC, the chain
+    /// length, and the value CRC32. A bad chain is [`StorageError`], not an
+    /// empty value.
+    #[inline]
+    pub fn read_overflow(&self, stub: &OverflowStub) -> Result<Vec<u8>, StorageError> {
+        self.heap.read_overflow_value(stub)
+    }
+}
+
 /// A table combines a heap file, schema, and optional indexes.
 ///
 /// Mission C Phase 17: indexes used to live in a `FxHashMap<String,
@@ -2350,6 +2376,22 @@ impl Table {
         })
     }
 
+    /// Walk every live slot's raw on-disk bytes, with early termination.
+    ///
+    /// Unlike [`Self::try_for_each_row_raw`], this does not rehydrate a v2 row
+    /// and does not skip one. v2 bytes stay v2. A spilled column is an
+    /// [`OverflowStub`] inside those bytes ([`crate::row::raw_stub`]); the
+    /// caller fetches it with [`OnDiskSlot::read_overflow`], which borrows the
+    /// heap for the duration of the callback. Fixed columns and inline var
+    /// columns have no stub.
+    pub fn try_for_each_on_disk_row<F>(&self, mut f: F) -> io::Result<()>
+    where
+        F: FnMut(RowId, OnDiskSlot<'_>) -> std::ops::ControlFlow<()>,
+    {
+        let heap = &self.heap;
+        heap.try_for_each_row(|rid, data| f(rid, OnDiskSlot { bytes: data, heap }))
+    }
+
     /// Point lookup through the index on `col_name`.
     ///
     /// `Ok(None)` when the column has no index or no row carries `key`. On a
@@ -2545,6 +2587,36 @@ mod projected_tests {
             None
         );
         assert!(table.get_projected(rid, &[3]).is_err());
+    }
+
+    #[test]
+    fn try_for_each_on_disk_row_keeps_spilled_stubs() {
+        let (_dir, table, rid, row) = projected_table();
+        let Value::Bytes(payload) = &row[2] else {
+            panic!("payload column is bytes");
+        };
+        let schema = table.schema().clone();
+        let layout = RowLayout::new(&schema);
+        let mut saw = false;
+        table
+            .try_for_each_on_disk_row(|got, slot| {
+                if got == rid {
+                    saw = true;
+                    let bytes = slot.bytes();
+                    assert!(crate::row::row_is_v2(bytes));
+                    assert!(
+                        bytes.len() < payload.len(),
+                        "v2 slot must stay a stub, not a rehydrated row"
+                    );
+                    let stub =
+                        crate::row::raw_stub(&schema, &layout, bytes, 2).expect("payload stub");
+                    let fetched = slot.read_overflow(&stub).expect("chain");
+                    assert_eq!(fetched, *payload);
+                }
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert!(saw, "the spilled row must be visited, not skipped");
     }
 
     #[test]

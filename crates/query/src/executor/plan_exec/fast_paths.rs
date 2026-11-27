@@ -3,7 +3,8 @@
 
 use crate::cancel::CancelCheck;
 use crate::result::{QueryError, QueryResult};
-use powdb_storage::row::{decode_column, RowLayout};
+use powdb_storage::error::StorageError;
+use powdb_storage::row::{decode_column, raw_stub, OverflowStub, RowLayout};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::ops::ControlFlow;
@@ -389,8 +390,14 @@ impl Engine {
         Ok(Some(result))
     }
 
-    /// `Project(Limit(Filter(SeqScan)))` and `Project(Limit(SeqScan))`.
-    /// Streams rows, decodes only projected columns, stops at the limit.
+    /// `Project(Limit(Filter(SeqScan)))`, `Project(Limit(SeqScan))`,
+    /// `Project(Filter(SeqScan))`, and `Project(SeqScan)`.
+    ///
+    /// Streams raw on-disk bytes, decodes only projected columns, and stops
+    /// at the limit. A spilled column is fetched only when it is projected.
+    /// A corrupt chain on a projected column is an error, not an empty cell.
+    /// A predicate that names a variable-length column still takes the
+    /// generic path: the compiled predicate's v2 fallback cannot see the heap.
     pub(crate) fn project_filter_limit_fast(
         &self,
         table: &str,
@@ -399,12 +406,6 @@ impl Engine {
         predicate: Option<&Expr>,
     ) -> Result<Option<QueryResult>, QueryError> {
         if self.generic_path_forced("project-filter-limit") {
-            return Ok(None);
-        }
-        // Overflow safety (P0-4): raw-byte projection over rehydrated rows
-        // drops any row with a value too large to re-inline (>= 64KB) and
-        // cannot return such a value; fall back to the decoded generic path.
-        if self.catalog.table_has_overflow(table) {
             return Ok(None);
         }
         if limit == 0 {
@@ -455,30 +456,51 @@ impl Engine {
             None => None,
         };
 
+        // Fixed types never spill, so a predicate on them is correct against
+        // raw v2 bytes (the compiled leaf's v2 fallback uses `decode_column`).
+        // A variable-length column may be a stub, and that fallback reports
+        // the stub as Empty. Unknown names have the same problem: bail.
+        if self.catalog.table_has_overflow(table) {
+            if let Some(pred) = predicate {
+                if expr_forces_generic_on_overflow(pred, &schema) {
+                    return Ok(None);
+                }
+            }
+        }
+
         let mut out: Vec<Vec<Value>> = Vec::with_capacity(limit.min(1024));
-        // Mission D2: use try_for_each_row_raw to actually stop iterating
-        // once the limit is reached. The previous `done` flag only short-
-        // circuited the closure body, so a `limit 100` over 100K rows still
-        // walked all 100K slots — burning ~30x SQLite on scan_filter_project_top100.
+        // Mission D2: stop iterating once the limit is reached. The previous
+        // `done` flag only short-circuited the closure body, so a `limit 100`
+        // over 100K rows still walked all 100K slots.
         // Cooperative cancellation: an unbounded (limit == usize::MAX) projected
         // scan over a huge table must stay stoppable.
         let mut cancel = CancelCheck::new();
         let mut cancel_err: Option<QueryError> = None;
+        let mut overflow_err: Option<QueryError> = None;
         self.catalog
-            .try_for_each_row_raw(table, |_rid, data| {
+            .try_for_each_on_disk_row(table, |_rid, slot| {
                 if let Err(e) = cancel.tick() {
                     cancel_err = Some(e);
                     return ControlFlow::Break(());
                 }
+                let data = slot.bytes();
                 if let Some(ref pred) = compiled_pred {
                     if !pred(data) {
                         return ControlFlow::Continue(());
                     }
                 }
-                let row: Vec<Value> = proj_indices
-                    .iter()
-                    .map(|&ci| decode_column(&schema, &row_layout, data, ci))
-                    .collect();
+                let mut row = Vec::with_capacity(proj_indices.len());
+                for &column in &proj_indices {
+                    match decode_projected_column(&schema, &row_layout, data, column, |stub| {
+                        slot.read_overflow(stub)
+                    }) {
+                        Ok(value) => row.push(value),
+                        Err(error) => {
+                            overflow_err = Some(error);
+                            return ControlFlow::Break(());
+                        }
+                    }
+                }
                 out.push(row);
                 if out.len() >= limit {
                     ControlFlow::Break(())
@@ -487,6 +509,9 @@ impl Engine {
                 }
             })
             .map_err(QueryError::from_storage_io)?;
+        if let Some(error) = overflow_err {
+            return Err(error);
+        }
         if let Some(e) = cancel_err {
             return Err(e);
         }
@@ -792,6 +817,174 @@ impl Engine {
             rows,
         }))
     }
+}
+
+/// Decode one projected column from raw on-disk bytes.
+///
+/// A stub is fetched. Anything else uses [`decode_column`], which is correct
+/// for fixed columns and inline var columns and returns Empty for a stub the
+/// caller did not fetch. A stub on a fixed type is a bug, not a value.
+fn decode_projected_column(
+    schema: &Schema,
+    layout: &RowLayout,
+    data: &[u8],
+    column: usize,
+    read_overflow: impl FnOnce(&OverflowStub) -> Result<Vec<u8>, StorageError>,
+) -> Result<Value, QueryError> {
+    let Some(stub) = raw_stub(schema, layout, data, column) else {
+        return Ok(decode_column(schema, layout, data, column));
+    };
+    let bytes = read_overflow(&stub)?;
+    Ok(match schema.columns[column].type_id {
+        TypeId::Str => Value::Str(String::from_utf8_lossy(&bytes).into_owned()),
+        TypeId::Bytes => Value::Bytes(bytes),
+        TypeId::Json => Value::Json(bytes.into()),
+        _ => {
+            return Err(QueryError::from(StorageError::CorruptData(
+                "overflow stub on a fixed-width column".into(),
+            )));
+        }
+    })
+}
+
+/// Whether a predicate on an overflow table must leave this fast path.
+///
+/// True when any field is variable-length ([`TypeId::Str`], [`TypeId::Bytes`],
+/// [`TypeId::Json`]) or names a column this schema does not have. Fixed
+/// columns never spill. No predicate is not this function's problem.
+fn expr_forces_generic_on_overflow(expr: &Expr, schema: &Schema) -> bool {
+    match expr {
+        Expr::Field(name) => field_forces_generic_on_overflow(schema, name),
+        Expr::QualifiedField { field, .. } => field_forces_generic_on_overflow(schema, field),
+        Expr::Literal(_) | Expr::Param(_) | Expr::ValueLit(_) | Expr::Null => false,
+        Expr::BinaryOp(left, _, right) | Expr::Coalesce(left, right) => {
+            expr_forces_generic_on_overflow(left, schema)
+                || expr_forces_generic_on_overflow(right, schema)
+        }
+        Expr::UnaryOp(_, inner) | Expr::Cast(inner, _) | Expr::FunctionCall(_, inner, _) => {
+            expr_forces_generic_on_overflow(inner, schema)
+        }
+        Expr::ScalarFunc(_, args) => args
+            .iter()
+            .any(|arg| expr_forces_generic_on_overflow(arg, schema)),
+        Expr::InList { expr, list, .. } => {
+            expr_forces_generic_on_overflow(expr, schema)
+                || list
+                    .iter()
+                    .any(|item| expr_forces_generic_on_overflow(item, schema))
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            expr_forces_generic_on_overflow(expr, schema)
+                || query_forces_generic_on_overflow(subquery, schema)
+        }
+        Expr::ExistsSubquery { subquery, .. } => query_forces_generic_on_overflow(subquery, schema),
+        Expr::Case { whens, else_expr } => {
+            whens.iter().any(|(when, then)| {
+                expr_forces_generic_on_overflow(when, schema)
+                    || expr_forces_generic_on_overflow(then, schema)
+            }) || else_expr
+                .as_ref()
+                .is_some_and(|expr| expr_forces_generic_on_overflow(expr, schema))
+        }
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            args.iter()
+                .any(|arg| expr_forces_generic_on_overflow(arg, schema))
+                || partition_by
+                    .iter()
+                    .any(|arg| expr_forces_generic_on_overflow(arg, schema))
+                || order_by
+                    .iter()
+                    .any(|key| expr_forces_generic_on_overflow(&key.expr, schema))
+        }
+        Expr::NestedQuery(nested) => nested_forces_generic_on_overflow(nested, schema),
+        Expr::LinkPath { column, .. } => field_forces_generic_on_overflow(schema, column),
+        Expr::JsonPath { base, .. } => expr_forces_generic_on_overflow(base, schema),
+    }
+}
+
+fn field_forces_generic_on_overflow(schema: &Schema, name: &str) -> bool {
+    match schema.column_index(name) {
+        Some(index) => matches!(
+            schema.columns[index].type_id,
+            TypeId::Str | TypeId::Bytes | TypeId::Json
+        ),
+        None => true,
+    }
+}
+
+fn query_forces_generic_on_overflow(query: &QueryExpr, schema: &Schema) -> bool {
+    query.joins.iter().any(|join| {
+        join.on
+            .as_ref()
+            .is_some_and(|on| expr_forces_generic_on_overflow(on, schema))
+    }) || query
+        .filter
+        .as_ref()
+        .is_some_and(|filter| expr_forces_generic_on_overflow(filter, schema))
+        || query
+            .order
+            .as_ref()
+            .is_some_and(|order| order_forces_generic_on_overflow(order, schema))
+        || query
+            .limit
+            .as_ref()
+            .is_some_and(|limit| expr_forces_generic_on_overflow(limit, schema))
+        || query
+            .offset
+            .as_ref()
+            .is_some_and(|offset| expr_forces_generic_on_overflow(offset, schema))
+        || query.projection.as_ref().is_some_and(|fields| {
+            fields
+                .iter()
+                .any(|field| expr_forces_generic_on_overflow(&field.expr, schema))
+        })
+        || query.aggregation.as_ref().is_some_and(|agg| {
+            agg.argument
+                .as_ref()
+                .is_some_and(|argument| expr_forces_generic_on_overflow(argument, schema))
+        })
+        || query.group_by.as_ref().is_some_and(|group| {
+            group
+                .keys
+                .iter()
+                .any(|key| expr_forces_generic_on_overflow(&key.expr, schema))
+                || group
+                    .having
+                    .as_ref()
+                    .is_some_and(|having| expr_forces_generic_on_overflow(having, schema))
+        })
+}
+
+fn nested_forces_generic_on_overflow(nested: &NestedQuery, schema: &Schema) -> bool {
+    expr_forces_generic_on_overflow(&nested.filter, schema)
+        || nested
+            .order
+            .as_ref()
+            .is_some_and(|order| order_forces_generic_on_overflow(order, schema))
+        || nested
+            .limit
+            .as_ref()
+            .is_some_and(|limit| expr_forces_generic_on_overflow(limit, schema))
+        || nested
+            .offset
+            .as_ref()
+            .is_some_and(|offset| expr_forces_generic_on_overflow(offset, schema))
+        || nested
+            .fields
+            .iter()
+            .any(|field| expr_forces_generic_on_overflow(&field.expr, schema))
+}
+
+fn order_forces_generic_on_overflow(order: &OrderClause, schema: &Schema) -> bool {
+    order
+        .keys
+        .iter()
+        .any(|key| expr_forces_generic_on_overflow(&key.expr, schema))
 }
 
 #[cfg(test)]

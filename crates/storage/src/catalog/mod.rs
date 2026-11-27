@@ -4,7 +4,7 @@ use crate::heap::{DirtyPageBudget, HeapFile};
 use crate::page::{UpdateFit, OVERFLOW_CHAIN_END, OVERFLOW_PAYLOAD_CAP};
 use crate::row::{encode_row_into, encode_row_v2_into, plan_spill, OverflowStub, MAX_VALUE_SIZE};
 use crate::stored_json_path::{StoredJsonPathSegmentV1, StoredJsonPathV1};
-use crate::table::Table;
+use crate::table::{OnDiskSlot, Table};
 use crate::types::*;
 use crate::wal::{Wal, WalDurabilityTicket, WalRecord, WalRecordType, WalSyncMode};
 use rustc_hash::FxHashMap;
@@ -3028,6 +3028,15 @@ impl Catalog {
         F: FnMut(RowId, &[u8]) -> std::ops::ControlFlow<()>,
     {
         self.by_name(table)?.try_for_each_row_raw(f)
+    }
+
+    /// Raw on-disk scan. v2 bytes stay v2 and the caller handles stubs.
+    /// Delegates to [`Table::try_for_each_on_disk_row`]. No rehydrate, no skip.
+    pub fn try_for_each_on_disk_row<F>(&self, table: &str, f: F) -> io::Result<()>
+    where
+        F: FnMut(RowId, OnDiskSlot<'_>) -> std::ops::ControlFlow<()>,
+    {
+        self.by_name(table)?.try_for_each_on_disk_row(f)
     }
 
     pub fn create_index(&mut self, table: &str, column: &str) -> io::Result<()> {
