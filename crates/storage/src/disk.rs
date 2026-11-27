@@ -243,10 +243,8 @@ impl DiskManager {
 /// `depth` must be nonzero. Depth one is a serial loop; higher depths use at
 /// most `depth` scoped threads sharing the positioned-I/O disk handle. Each
 /// thread groups its slice into maximal runs of ids where each id is exactly
-/// one greater than the previous. A run that fits in one device transfer is
-/// one positioned read. A longer run keeps one `pread` in flight and checks
-/// the previous window while that read runs. A single page stays
-/// [`DiskManager::read_page`].
+/// one greater than the previous. A longer run is one positioned read of
+/// `run_len * PAGE_SIZE` bytes; a single page stays [`DiskManager::read_page`].
 /// A gap, a duplicate, or a decreasing id is not coalesced. This is opt-in and
 /// does not change [`DiskManager::read_page`] or heap point reads. Checksums
 /// follow [`Page::from_bytes_verified`]'s validate-if-present policy. Any read,
@@ -324,63 +322,6 @@ fn read_pages_in_chunks(
     Ok(pages)
 }
 
-// 32 * 4 KiB = 128 KiB, one transfer on an NVMe with max_sectors_kb of 128.
-// Shorter multi-page runs stay one pread.
-const ONE_TRANSFER_PAGES: usize = 32;
-
-// 2048 * 4 KiB = 8 MiB. Checksum of one window runs while the next window
-// is read, so one pread is in flight. Page-at-a-time consumption was
-// measured at 5677f07: warm 24.9 ms, cold 32.9 ms. This is not another
-// sliced window with the checksum after the read returns.
-const PIPELINE_PAGES: usize = 2048;
-
-fn read_window(disk: &DiskManager, start_id: u32, slots: &mut [[u8; PAGE_SIZE]]) -> io::Result<()> {
-    if slots.len() == 1 {
-        slots[0] = disk.read_page(start_id)?;
-        Ok(())
-    } else {
-        disk.read_contiguous_into(start_id, slots)
-    }
-}
-
-fn verify_window(slots: &[[u8; PAGE_SIZE]]) -> io::Result<()> {
-    for page in slots {
-        Page::from_bytes_verified(page).map_err(io::Error::from)?;
-    }
-    Ok(())
-}
-
-// One pread in flight. The caller checksums the window already in memory
-// while a helper reads the next window into the output slots.
-fn read_long_run(disk: &DiskManager, run: &[u32], slots: &mut [[u8; PAGE_SIZE]]) -> io::Result<()> {
-    debug_assert!(run.len() > ONE_TRANSFER_PAGES);
-    debug_assert_eq!(run.len(), slots.len());
-    let first = run.len().min(PIPELINE_PAGES);
-    read_window(disk, run[0], &mut slots[..first])?;
-    let mut verified_until = 0;
-    let mut read_until = first;
-    while read_until < run.len() {
-        let n = (run.len() - read_until).min(PIPELINE_PAGES);
-        let start_id = run[read_until];
-        let (done, rest) = slots.split_at_mut(read_until);
-        let verify_slots = &done[verified_until..];
-        let read_slots = &mut rest[..n];
-        std::thread::scope(|scope| {
-            let handle = scope.spawn(move || read_window(disk, start_id, read_slots));
-            let verified = verify_window(verify_slots);
-            let read = handle
-                .join()
-                .map_err(|_| io::Error::other("page reader thread panicked"))
-                .and_then(|result| result);
-            verified?;
-            read
-        })?;
-        verified_until = read_until;
-        read_until += n;
-    }
-    verify_window(&slots[verified_until..read_until])
-}
-
 // Maximal runs: each id is exactly one greater than the previous. A gap, a
 // duplicate, or a decrease starts a new run. `checked_add` refuses a wrap
 // from `u32::MAX` to 0, which is not contiguous on disk.
@@ -400,13 +341,11 @@ fn verify_contiguous_runs(
             let bytes = disk.read_page(start_id)?;
             Page::from_bytes_verified(&bytes).map_err(io::Error::from)?;
             slots[0] = bytes;
-        } else if run.len() <= ONE_TRANSFER_PAGES {
+        } else {
             disk.read_contiguous_into(start_id, slots)?;
             for page in slots.iter() {
                 Page::from_bytes_verified(page).map_err(io::Error::from)?;
             }
-        } else {
-            read_long_run(disk, run, slots)?;
         }
     }
     debug_assert_eq!(filled, ids.len());
@@ -463,29 +402,6 @@ mod tests {
                 assert_eq!(read_pages_verified(&disk, ids, depth).unwrap(), expected);
             }
         }
-    }
-
-    #[test]
-    fn batch_streamed_run_matches_serial_and_refuses_a_late_corrupt_page() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut disk = DiskManager::create(&dir.path().join("stream.heap")).unwrap();
-        let count = PIPELINE_PAGES + 8;
-        for _ in 0..count {
-            let id = disk.allocate_page().unwrap();
-            let mut page = Page::new(id, PageType::Data);
-            page.insert(&id.to_le_bytes()).unwrap();
-            page.stamp_checksum();
-            disk.write_page(id, page.as_bytes()).unwrap();
-        }
-        let ids: Vec<u32> = (0..count as u32).collect();
-        let expected: Vec<_> = ids.iter().map(|&id| disk.read_page(id).unwrap()).collect();
-        for depth in [1, 4] {
-            assert_eq!(read_pages_verified(&disk, &ids, depth).unwrap(), expected);
-        }
-        let mut bytes = disk.read_page(count as u32 - 1).unwrap();
-        bytes[80] ^= 1;
-        disk.write_page(count as u32 - 1, &bytes).unwrap();
-        assert!(read_pages_verified(&disk, &ids, 1).is_err());
     }
 
     #[test]

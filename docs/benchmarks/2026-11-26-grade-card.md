@@ -133,6 +133,20 @@ Evidence: `docs/benchmarks/2026-11-26-library-page-stream.json`, ext4 on `nvme0n
 
 The assigned grade stays 7.5. Reading one page at a time inside `read_pages_verified` is slower than one `pread` of the file (warm 19.2 ms, cold 28.4 ms). Do not retune 1.25.
 
+## Ext4 library run, checksum beside the next pread
+
+Evidence: `docs/benchmarks/2026-11-26-library-pipeline.json`, ext4 on `nvme0n1`, commit `5b25073`. A long run reads 8 MiB, then checks that window while the next 8 MiB is read. One `pread` is in flight. The fixture directory was removed. Every timed call matched. Warm samples moved 0 bytes. Cold sequential samples moved exactly 67,112,960 bytes.
+
+| Id | Result | 9.2 |
+| --- | --- | --- |
+| R1 | Depth 1 median 133.9 ms. Depth 16 median 15.5 ms (8.62×). Device bytes 5.1% to 6.2% over 16 MiB. | Met |
+| S1 | Cold depth 1 median 31.5 ms, warm 16.2 ms, ratio 1.94. Warm is under 21.4 ms. Device bytes equal the file. | Not met |
+| F1 | Serial reread 4.6 ms, one pass 1.1 ms (23% of the reread). Process bytes 192,512 on both. | Met |
+| I1 | Every timed call matched. The two-window corrupt-page test passed. | Met |
+| P1 | `read_page` is still one pread. Storage library tests: 277 passed, 1 ignored. | Met |
+
+The assigned grade stays 7.5. Cold is slower than one `pread` of the file (28.4 ms) and the ratio is worse. The helper thread did not hide the device time behind the checksum. That pipeline is not kept. Do not retune 1.25.
+
 ## Rules for the push
 
 - Side branch only. Do not merge to `main` and do not push unless Kirby asks.
