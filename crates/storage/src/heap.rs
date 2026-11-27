@@ -1112,7 +1112,8 @@ impl HeapFile {
             }
             let buf = self.disk.read_page(pid).map_err(StorageError::Io)?;
             // Verify the page CRC so on-disk bit-rot in a chain page is caught.
-            Page::from_bytes_verified(&buf)?;
+            // The chunk is taken from `buf`, so the check must not copy a Page.
+            Page::verify_bytes(&buf)?;
             if buf[4] != PageType::Overflow as u8 {
                 return Err(StorageError::OverflowCorrupt(format!(
                     "overflow chain page {pid} is not an Overflow page"
@@ -1625,12 +1626,17 @@ impl HeapFile {
         let buf = self.disk.read_page(rid.page_id)?;
         // The disk point-lookup path consults the CRC (validate-if-present)
         // rather than trusting the bytes, so a corrupt page is refused
-        // instead of yielding garbage or panicking.
-        let page = Page::from_bytes_verified(&buf)?;
+        // instead of yielding garbage or panicking. The row is copied out of
+        // `buf`, so the check must not build a Page.
+        Page::verify_bytes(&buf)?;
         // The CRC only covers pages this build (or a recent one) wrote. A
         // legacy page has none, so the row header is the last thing standing
         // between rotted bytes and a decoder that trusts the version.
-        match page.get(rid.slot_index) {
+        // `slot_bytes_from_page` does not check the slot count itself.
+        if rid.slot_index >= crate::page::slot_count_from_page(&buf) {
+            return Ok(None);
+        }
+        match crate::page::slot_bytes_from_page(&buf, rid.slot_index) {
             Some(row) => {
                 validate_row_format(row)?;
                 Ok(Some(row.to_vec()))
