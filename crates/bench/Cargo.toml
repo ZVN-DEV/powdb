@@ -96,6 +96,12 @@ name = "cold-page-probe"
 path = "src/bin/cold_page_probe.rs"
 test = true
 
+# One readonly unique-range fetch after heap eviction. Not part of the criterion gate.
+[[bin]]
+name = "cold-query-probe"
+path = "src/bin/cold_query_probe.rs"
+test = false
+
 [[bench]]
 name = "powql"
 harness = false
