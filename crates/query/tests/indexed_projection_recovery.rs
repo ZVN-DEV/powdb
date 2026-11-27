@@ -118,7 +118,7 @@ fn cached_indexed_projection_revalidates_live_schema_and_types() {
 }
 
 #[test]
-fn indexed_projection_still_checks_unselected_overflow_corruption() {
+fn indexed_projection_reads_a_corrupt_chain_only_when_selected() {
     let (_dir, mut engine) = fixture();
     let table = engine.catalog_mut().get_table_mut("T").unwrap();
     let rid = table.index_lookup_all("id", &Value::Int(1))[0];
@@ -129,14 +129,21 @@ fn indexed_projection_still_checks_unselected_overflow_corruption() {
         .heap
         .write_overflow_page(stub.first_page, OVERFLOW_CHAIN_END, b"corrupt", 0)
         .unwrap();
-    for query in ["T filter .id = 1 { .body }", "T filter .id = 1 { .name }"] {
-        for result in [
-            engine.execute_powql(query),
-            engine.execute_powql_readonly(query),
-        ] {
-            let error = result.expect_err("full-row read must validate even unselected spill");
-            assert!(error.to_string().contains("overflow"), "{error}");
-        }
+    for result in [
+        engine.execute_powql("T filter .id = 1 { .body }"),
+        engine.execute_powql_readonly("T filter .id = 1 { .body }"),
+    ] {
+        let error = result.expect_err("a projected corrupt chain must fail");
+        assert!(error.to_string().contains("overflow"), "{error}");
+    }
+    let name = vec![vec![Value::Str("same".into())]];
+    for result in [
+        engine.execute_powql("T filter .id = 1 { .name }"),
+        engine.execute_powql_readonly("T filter .id = 1 { .name }"),
+    ] {
+        let (columns, actual) = rows(result.expect("an unselected chain is not read"));
+        assert_eq!(columns, vec!["name".to_string()]);
+        assert_eq!(actual, name);
     }
 }
 

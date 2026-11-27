@@ -1558,17 +1558,8 @@ impl Table {
         Ok(rows)
     }
 
-    /// Read only the requested logical columns from one row.
-    ///
-    /// Output order exactly follows `column_indices`, including duplicates.
-    /// Inline values are decoded directly from the row body. For a v2 row,
-    /// an overflow chain is fetched and verified only when its column was
-    /// requested; an unselected spilled value is never touched.
-    pub fn get_projected(
-        &self,
-        rid: RowId,
-        column_indices: &[usize],
-    ) -> io::Result<Option<Vec<Value>>> {
+    /// Reject a projected index the caller cannot name, before any heap I/O.
+    fn ensure_projected_column_indexes(&self, column_indices: &[usize]) -> io::Result<()> {
         for &column_index in column_indices {
             if column_index >= self.schema.columns.len() {
                 return Err(io::Error::new(
@@ -1580,10 +1571,22 @@ impl Table {
                 ));
             }
         }
+        Ok(())
+    }
 
-        let Some(data) = self.heap.get(rid)? else {
-            return Ok(None);
-        };
+    /// Decode `column_indices` from one row body.
+    ///
+    /// Duplicate indexes clone the value already decoded. A spilled column
+    /// is read from its overflow chain only when this request names it.
+    /// `get_projected` and `get_many_projected` both go through here, including
+    /// the UTF-8 check on a spilled string.
+    fn projected_values_from_body(
+        schema: &Schema,
+        layout: &RowLayout,
+        heap: &HeapFile,
+        data: &[u8],
+        column_indices: &[usize],
+    ) -> io::Result<Vec<Value>> {
         let mut values: Vec<Value> = Vec::with_capacity(column_indices.len());
         for (request_position, &column_index) in column_indices.iter().enumerate() {
             if let Some(previous_position) = column_indices[..request_position]
@@ -1594,14 +1597,10 @@ impl Table {
                 continue;
             }
 
-            let value = if let Some(stub) =
-                crate::row::raw_stub(&self.schema, &self.row_layout, &data, column_index)
+            let value = if let Some(stub) = crate::row::raw_stub(schema, layout, data, column_index)
             {
-                let bytes = self
-                    .heap
-                    .read_overflow_value(&stub)
-                    .map_err(io::Error::from)?;
-                match self.schema.columns[column_index].type_id {
+                let bytes = heap.read_overflow_value(&stub).map_err(io::Error::from)?;
+                match schema.columns[column_index].type_id {
                     TypeId::Str => Value::Str(String::from_utf8(bytes).map_err(|error| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -1618,11 +1617,69 @@ impl Table {
                     }
                 }
             } else {
-                decode_column(&self.schema, &self.row_layout, &data, column_index)
+                decode_column(schema, layout, data, column_index)
             };
             values.push(value);
         }
-        Ok(Some(values))
+        Ok(values)
+    }
+
+    /// Read only the requested logical columns from one row.
+    ///
+    /// Output order exactly follows `column_indices`, including duplicates.
+    /// Inline values are decoded directly from the row body. For a v2 row,
+    /// an overflow chain is fetched and verified only when its column was
+    /// requested; an unselected spilled value is never touched.
+    pub fn get_projected(
+        &self,
+        rid: RowId,
+        column_indices: &[usize],
+    ) -> io::Result<Option<Vec<Value>>> {
+        self.ensure_projected_column_indexes(column_indices)?;
+        let Some(data) = self.heap.get(rid)? else {
+            return Ok(None);
+        };
+        Self::projected_values_from_body(
+            &self.schema,
+            &self.row_layout,
+            &self.heap,
+            &data,
+            column_indices,
+        )
+        .map(Some)
+    }
+
+    /// Read only the requested logical columns from many rows.
+    ///
+    /// Row bodies come from one [`HeapFile::get_many`] at `depth`. Output
+    /// order matches `rids`, and a missing row is `None`. Each present body
+    /// is decoded by [`Self::projected_values_from_body`], so an overflow
+    /// chain is followed only for a requested column. A chain error is
+    /// returned. An out-of-range column index is rejected before any I/O.
+    /// [`Self::get_many`] is unchanged and still reassembles every chain.
+    pub fn get_many_projected(
+        &self,
+        rids: &[RowId],
+        column_indices: &[usize],
+        depth: usize,
+    ) -> io::Result<Vec<Option<Vec<Value>>>> {
+        self.ensure_projected_column_indexes(column_indices)?;
+        let raw = self.heap.get_many(rids, depth)?;
+        let mut rows = Vec::with_capacity(raw.len());
+        for data in raw {
+            let Some(data) = data else {
+                rows.push(None);
+                continue;
+            };
+            rows.push(Some(Self::projected_values_from_body(
+                &self.schema,
+                &self.row_layout,
+                &self.heap,
+                &data,
+                column_indices,
+            )?));
+        }
+        Ok(rows)
     }
 
     /// Delete a row. Mission C Phase 7: if the table has indexes, we used to
@@ -2640,6 +2697,106 @@ mod projected_tests {
             .get_projected(rid, &[1])
             .expect_err("selected corrupt chain must fail");
         assert!(error.to_string().contains("overflow value length"));
+    }
+
+    fn inline_projected_row(id: i64, payload: &[u8]) -> Vec<Value> {
+        let json = crate::pj1::parse_json_text(r#"{"ok":true}"#).expect("valid JSON");
+        vec![
+            Value::Int(id),
+            Value::Json(json.into_boxed_slice()),
+            Value::Bytes(payload.to_vec()),
+        ]
+    }
+
+    #[test]
+    fn get_many_projected_keeps_order_and_skips_unselected_spills() {
+        let (_dir, mut table, spilled_rid, spilled_row) = projected_table();
+        let short_row = inline_projected_row(3, b"ok");
+        let other_row = inline_projected_row(9, b"zz");
+        let short_rid = table.insert(&short_row).expect("short row");
+        let other_rid = table.insert(&other_row).expect("other row");
+        let missing = RowId {
+            page_id: u32::MAX,
+            slot_index: u16::MAX,
+        };
+        let short_raw = table
+            .heap
+            .get(short_rid)
+            .expect("short row bytes")
+            .expect("short row present");
+        assert!(
+            crate::row::raw_stub(&table.schema, table.row_layout(), &short_raw, 2).is_none(),
+            "the short payload must stay inline"
+        );
+
+        let rids = [other_rid, spilled_rid, missing, short_rid];
+        let ids = table
+            .get_many_projected(&rids, &[0], 16)
+            .expect("id projection");
+        assert_eq!(
+            ids,
+            vec![
+                Some(vec![other_row[0].clone()]),
+                Some(vec![spilled_row[0].clone()]),
+                None,
+                Some(vec![short_row[0].clone()]),
+            ]
+        );
+
+        let payloads = table
+            .get_many_projected(&[spilled_rid, short_rid], &[2], 16)
+            .expect("payload projection");
+        assert_eq!(
+            payloads,
+            vec![
+                Some(vec![spilled_row[2].clone()]),
+                Some(vec![short_row[2].clone()]),
+            ]
+        );
+
+        let duplicate_columns = [2, 0, 1, 2];
+        assert_eq!(
+            table
+                .get_many_projected(&[spilled_rid, missing, short_rid], &duplicate_columns, 16)
+                .expect("duplicate columns"),
+            vec![
+                table
+                    .get_projected(spilled_rid, &duplicate_columns)
+                    .expect("projected spilled"),
+                None,
+                table
+                    .get_projected(short_rid, &duplicate_columns)
+                    .expect("projected short"),
+            ]
+        );
+        assert!(table.get_many_projected(&[missing], &[3], 16).is_err());
+
+        let raw = table
+            .heap
+            .get(spilled_rid)
+            .expect("read row")
+            .expect("raw row");
+        let payload_stub =
+            crate::row::raw_stub(&table.schema, table.row_layout(), &raw, 2).expect("payload stub");
+        table
+            .heap
+            .write_overflow_page(payload_stub.first_page, OVERFLOW_CHAIN_END, b"corrupt", 0)
+            .expect("corrupt unselected chain");
+
+        assert_eq!(
+            table
+                .get_many_projected(&rids, &[0], 16)
+                .expect("unselected corruption must be unread"),
+            ids
+        );
+        let error = table
+            .get_many_projected(&[short_rid, spilled_rid], &[2], 16)
+            .expect_err("selected corrupt chain must fail the batch");
+        assert!(error.to_string().contains("overflow value length"));
+        assert!(
+            table.get_many(&[spilled_rid], 16).is_err(),
+            "full-row get_many still reassembles every chain"
+        );
     }
 }
 

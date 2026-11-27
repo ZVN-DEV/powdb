@@ -2257,27 +2257,23 @@ impl Engine {
                         let rids = tbl.index_lookup_all(column, &key_value);
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
                         let mut cancel = crate::cancel::CancelCheck::new();
-                        // Overflow safety (P0-3/P0-4): the heap fetch reassembles
-                        // spilled projected columns so they return their value,
-                        // not Empty / a wrapped >= 64KB blob.
-                        // Page ids are known. Fetch disk pages in a batch.
-                        // Depth 16 is the measured cold-random depth. One row
-                        // still goes through the ordinary point read.
+                        // Overflow safety (P0-3/P0-4): a requested spill is
+                        // reassembled. An unrequested chain is not read. One
+                        // row uses `get_projected`. A wider match reads the
+                        // row pages together at depth 16.
                         for chunk in rids.chunks(4_096) {
                             for _ in chunk {
                                 cancel.tick()?;
                             }
                             let fetched = if chunk.len() == 1 {
-                                vec![tbl.get(chunk[0]).map_err(QueryError::from_storage_io)?]
+                                vec![tbl
+                                    .get_projected(chunk[0], &proj_indices)
+                                    .map_err(QueryError::from_storage_io)?]
                             } else {
-                                tbl.get_many(chunk, 16)
+                                tbl.get_many_projected(chunk, &proj_indices, 16)
                                     .map_err(QueryError::from_storage_io)?
                             };
-                            for full in fetched.into_iter().flatten() {
-                                let row: Vec<Value> =
-                                    proj_indices.iter().map(|&ci| full[ci].clone()).collect();
-                                rows.push(row);
-                            }
+                            rows.extend(fetched.into_iter().flatten());
                         }
                         return Ok(QueryResult::Rows {
                             columns: proj_columns,
