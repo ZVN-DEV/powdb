@@ -243,8 +243,10 @@ impl DiskManager {
 /// `depth` must be nonzero. Depth one is a serial loop; higher depths use at
 /// most `depth` scoped threads sharing the positioned-I/O disk handle. Each
 /// thread groups its slice into maximal runs of ids where each id is exactly
-/// one greater than the previous. A longer run is one positioned read of
-/// `run_len * PAGE_SIZE` bytes; a single page stays [`DiskManager::read_page`].
+/// one greater than the previous. A run that fits in one device transfer is
+/// one positioned read. A longer run is hinted with `POSIX_FADV_WILLNEED`
+/// once, then each page is read and checked so the checksum overlaps the
+/// rest of the fetch. A single page stays [`DiskManager::read_page`].
 /// A gap, a duplicate, or a decreasing id is not coalesced. This is opt-in and
 /// does not change [`DiskManager::read_page`] or heap point reads. Checksums
 /// follow [`Page::from_bytes_verified`]'s validate-if-present policy. Any read,
@@ -322,6 +324,42 @@ fn read_pages_in_chunks(
     Ok(pages)
 }
 
+// 32 * 4 KiB = 128 KiB, one transfer on an NVMe with max_sectors_kb of 128.
+// A longer run is not sliced into a searched window. The whole run is
+// hinted once, then consumed a page at a time. A single pread of that run
+// cannot checksum until every byte has arrived.
+const ONE_TRANSFER_PAGES: usize = 32;
+
+// Ask the kernel to fetch this run. A failed hint must not fail the read.
+fn advise_willneed(disk: &DiskManager, start_id: u32, pages: usize) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let offset = i64::from(start_id) * PAGE_SIZE as i64;
+        let len = pages as i64 * PAGE_SIZE as i64;
+        // Safety: the descriptor is the open heap. The range is this run,
+        // which the following reads cover.
+        unsafe {
+            libc::posix_fadvise(
+                disk.file_ref().as_raw_fd(),
+                offset,
+                len,
+                libc::POSIX_FADV_SEQUENTIAL,
+            );
+            libc::posix_fadvise(
+                disk.file_ref().as_raw_fd(),
+                offset,
+                len,
+                libc::POSIX_FADV_WILLNEED,
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (disk, start_id, pages);
+    }
+}
+
 // Maximal runs: each id is exactly one greater than the previous. A gap, a
 // duplicate, or a decrease starts a new run. `checked_add` refuses a wrap
 // from `u32::MAX` to 0, which is not contiguous on disk.
@@ -341,10 +379,17 @@ fn verify_contiguous_runs(
             let bytes = disk.read_page(start_id)?;
             Page::from_bytes_verified(&bytes).map_err(io::Error::from)?;
             slots[0] = bytes;
-        } else {
+        } else if run.len() <= ONE_TRANSFER_PAGES {
             disk.read_contiguous_into(start_id, slots)?;
             for page in slots.iter() {
                 Page::from_bytes_verified(page).map_err(io::Error::from)?;
+            }
+        } else {
+            advise_willneed(disk, start_id, run.len());
+            for (offset, page_id) in run.iter().enumerate() {
+                let bytes = disk.read_page(*page_id)?;
+                Page::from_bytes_verified(&bytes).map_err(io::Error::from)?;
+                slots[offset] = bytes;
             }
         }
     }
@@ -402,6 +447,29 @@ mod tests {
                 assert_eq!(read_pages_verified(&disk, ids, depth).unwrap(), expected);
             }
         }
+    }
+
+    #[test]
+    fn batch_streamed_run_matches_serial_and_refuses_a_late_corrupt_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut disk = DiskManager::create(&dir.path().join("stream.heap")).unwrap();
+        let count = ONE_TRANSFER_PAGES + 8;
+        for _ in 0..count {
+            let id = disk.allocate_page().unwrap();
+            let mut page = Page::new(id, PageType::Data);
+            page.insert(&id.to_le_bytes()).unwrap();
+            page.stamp_checksum();
+            disk.write_page(id, page.as_bytes()).unwrap();
+        }
+        let ids: Vec<u32> = (0..count as u32).collect();
+        let expected: Vec<_> = ids.iter().map(|&id| disk.read_page(id).unwrap()).collect();
+        for depth in [1, 4] {
+            assert_eq!(read_pages_verified(&disk, &ids, depth).unwrap(), expected);
+        }
+        let mut bytes = disk.read_page(count as u32 - 1).unwrap();
+        bytes[80] ^= 1;
+        disk.write_page(count as u32 - 1, &bytes).unwrap();
+        assert!(read_pages_verified(&disk, &ids, 1).is_err());
     }
 
     #[test]
