@@ -43,7 +43,7 @@ Evidence: `docs/benchmarks/2026-11-27-cold-query.json`, ext4 on `nvme0n1`, commi
 
 Cold median is 40.651 ms. The same machine's library depth-1 random read was 137.6 ms for half this many pages, so a one-pread-per-page walk of this heap would sit near 275 ms. 40.7 ms is the batched path, plus planning and row decode. This shape is every data page in key order, not the R1 sample of 4,096 pages drawn from a larger file, so it does not replace the R1 or S1 rows above. Warm at 0 bytes checks the eviction method. The fixture directory was removed.
 
-Known multi-rid fetches now call `Table::get_many` at depth 16 in chunks of 4,096. One-row chunks stay on `Table::get`. That covers read-only and mutable index lookups, both unique range scans, the mutable non-unique range, expression-index full rows, residual rows that already passed the projected check, nested index probes, and update/delete discovery. `try_bounded_index_page` is unchanged. Equivalence tests passed (13 and 4). Clippy `-D warnings` passed.
+Known multi-rid fetches now call `Table::get_many` at depth 16 in chunks of 4,096. One-row chunks stay on `Table::get`. That covers read-only and mutable index lookups, unique range scans, non-unique range scans on both executors, expression-index full rows, residual rows that already passed the projected check, nested index probes, and update/delete discovery. `try_bounded_index_page` is unchanged. Equivalence tests passed (13 and 4). Clippy `-D warnings` passed.
 
 ## Rules for the push
 

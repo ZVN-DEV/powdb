@@ -1546,7 +1546,6 @@ const SITES_REACHED_BY_THE_CORPUS: &[&str] = &[
     "readonly:count-fast-block",
     "readonly:filter-seqscan-raw",
     "readonly:project-over-index-scan",
-    "readonly:range-scan-scan-fallback:predicate",
     "update-byte-patch",
     "update-var-shrink",
 ];
@@ -1573,6 +1572,10 @@ const UNCOVERED_SITES: &[(&str, &str)] = &[
     (
         "readonly:index-scan-scan-fallback:predicate",
         "unreachable behind plan lowering",
+    ),
+    (
+        "readonly:range-scan-scan-fallback:predicate",
+        "unreachable behind plan lowering; indexed non-unique ranges use the btree",
     ),
     // Nested inside an outer guard: by the time compilation is attempted the
     // enclosing fast path has already declined, so these never record while the

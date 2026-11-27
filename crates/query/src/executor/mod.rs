@@ -1911,9 +1911,53 @@ impl Engine {
                 let start_inclusive = start.as_ref().map(|(_, inc)| *inc).unwrap_or(true);
                 let end_inclusive = end.as_ref().map(|(_, inc)| *inc).unwrap_or(true);
 
-                // Range scans only use the btree fast path for unique indexes.
-                // Non-unique indexes store composite keys that don't compare
-                // directly against raw column values.
+                // Non-unique index: walk the composite (value, rid) leaf
+                // chain between prefix bounds, fetch each row from the heap,
+                // and recheck. The recheck enforces exclusive bounds
+                // (range_rids is inclusive) and defensively skips any decoded
+                // null (nulls are never indexed, so they must not match).
+                if tbl.is_index_unique(column) == Some(false) {
+                    if let Some(btree) = tbl.index(column) {
+                        if start_val.is_some() || end_val.is_some() {
+                            let col_idx = schema.column_index(column).ok_or_else(|| {
+                                QueryError::ColumnNotFound {
+                                    table: String::new(),
+                                    column: column.clone(),
+                                }
+                            })?;
+                            let rids = btree.range_rids(start_val.as_ref(), end_val.as_ref());
+                            let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
+                            let mut cancel = crate::cancel::CancelCheck::new();
+                            for chunk in rids.chunks(4_096) {
+                                let fetched = if chunk.len() == 1 {
+                                    vec![tbl.get(chunk[0]).map_err(QueryError::from_storage_io)?]
+                                } else {
+                                    tbl.get_many(chunk, 16)
+                                        .map_err(QueryError::from_storage_io)?
+                                };
+                                for row in fetched {
+                                    cancel.tick()?;
+                                    if let Some(row) = row {
+                                        if !row[col_idx].is_empty()
+                                            && range_matches(
+                                                &row[col_idx],
+                                                &start_val,
+                                                start_inclusive,
+                                                &end_val,
+                                                end_inclusive,
+                                            )
+                                        {
+                                            rows.push(row);
+                                        }
+                                    }
+                                }
+                            }
+                            return Ok(QueryResult::Rows { columns, rows });
+                        }
+                    }
+                }
+
+                // Unique indexes store raw column-value keys.
                 if tbl.is_index_unique(column) == Some(true) {
                     if let Some(btree) = tbl.index(column) {
                         let hits: Vec<(Value, RowId)> = match (&start_val, &end_val) {
