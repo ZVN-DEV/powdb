@@ -189,6 +189,18 @@ Evidence: `docs/benchmarks/2026-11-27-library-both-halves.json`, ext4 on `nvme0n
 
 The assigned grade stays 7.5. Cold is worse than one `pread` (28.3 ms) and the ratio is worse. Warm got faster, which is the same pattern as the 8 MiB pipeline. Overlapping two buffered reads with the checksum does not hide the device time on this machine. Both two-pread schedules are dropped. The reader is one `pread` per contiguous run again, with `Page::verify_bytes`. Do not retune 1.25.
 
+## Ext4 scan versus one pread
+
+Evidence: `docs/benchmarks/2026-11-27-scan-compare.json`, ext4 on `nvme0n1`, binary `scan-compare` at commit `30d3596`. Same 16,384-row heap, 67,112,960 bytes. `HeapFile::open` warms the file, then `POSIX_FADV_DONTNEED` runs before `HeapFile::scan`, and again before `read_pages_verified` at depth 1. The heap is not reopened. Three cold runs. Both sides moved exactly 67,112,960 process bytes. Scan also copies every row into a `Vec`. The fixture directory was removed.
+
+| Run | `HeapFile::scan` | One `pread` |
+| --- | --- | --- |
+| 1 | 21.5 ms | 24.8 ms |
+| 2 | 20.0 ms | 23.1 ms |
+| 3 | 19.8 ms | 22.5 ms |
+
+The median scan is 20.0 ms. The median one-pread batch is 23.1 ms. Scan is faster on every run. Do not send `HeapFile::scan` through one `pread` of the file. This comparison is not an S1 sample. The graded sequential path is still `read_pages_verified`. The assigned grade stays 7.5.
+
 ## Rules for the push
 
 - Side branch only. Do not merge to `main` and do not push unless Kirby asks.

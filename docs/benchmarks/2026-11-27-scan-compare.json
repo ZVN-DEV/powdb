@@ -1,0 +1,12 @@
+{
+  "binary": "scan-compare",
+  "commit": "30d3596",
+  "filesystem": "ext4",
+  "heap_bytes": 67112960,
+  "note": "HeapFile::scan copies every row out. read_pages_verified does not. Both cold passes moved exactly the file.",
+  "runs": [
+    {"scan_us": 21488, "batch_us": 24774, "scan_read_bytes": 67112960, "batch_read_bytes": 67112960, "scan_rows": 16384},
+    {"scan_us": 20043, "batch_us": 23058, "scan_read_bytes": 67112960, "batch_read_bytes": 67112960, "scan_rows": 16384},
+    {"scan_us": 19832, "batch_us": 22545, "scan_read_bytes": 67112960, "batch_read_bytes": 67112960, "scan_rows": 16384}
+  ]
+}
