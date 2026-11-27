@@ -26,7 +26,24 @@ The 26 November cold run is the evidence under the 7.5. It is buffered `pread` o
 | I1 | Every timed call matched. A corrupt page is refused in `batch_refuses_corrupt_or_missing_pages`. | Holds on this run |
 | P1 | Batch depth is chosen by the caller. `read_page` is unchanged. | Holds |
 
-The assigned blind grade stays 7.5 until every bar is met on one run. Non-unique range scans in `Engine::dispatch_mut` now call `Table::get_many` (depth 16, chunks of 4096) when more than one row id is known. A single row still uses `Table::get`. Unique equality, the read-only server path, and `try_bounded_index_page` are unchanged. Equivalence tests passed. That wiring is not itself a new cold timing.
+The assigned blind grade stays 7.5 until every bar is met on one run. S1 is still the miss from the ext4 library run above. Do not retune that ratio.
+
+## Readonly unique range, 2026-11-27
+
+Evidence: `docs/benchmarks/2026-11-27-cold-query.json`, ext4 on `nvme0n1`, commit `a61bdae` on `bench/cold-page-reads`. The release binary ran `Gather filter .rk >= 0` through `Engine::execute_powql_readonly` after `posix_fadvise(DONTNEED)` on the heap. Keys were inserted shuffled and had to come back as `0..8191`, which is index order. The heap file is 33,558,528 bytes (8,193 pages). Each cold sample moved exactly 33,554,432 bytes in `/proc/self/io` and on `nvme0n1`: the 8,192 data pages, once. `nvme1n1` stayed at 0. The warm sample moved 0 bytes.
+
+| Sample | Cold | Time | Process bytes |
+| --- | --- | --- | --- |
+| 0 | yes | 40.651 ms | 33,554,432 |
+| 1 | yes | 40.109 ms | 33,554,432 |
+| 2 | yes | 45.503 ms | 33,554,432 |
+| 3 | yes | 43.656 ms | 33,554,432 |
+| 4 | yes | 37.115 ms | 33,554,432 |
+| 5 | no | 18.955 ms | 0 |
+
+Cold median is 40.651 ms. The same machine's library depth-1 random read was 137.6 ms for half this many pages, so a one-pread-per-page walk of this heap would sit near 275 ms. 40.7 ms is the batched path, plus planning and row decode. This shape is every data page in key order, not the R1 sample of 4,096 pages drawn from a larger file, so it does not replace the R1 or S1 rows above. Warm at 0 bytes checks the eviction method. The fixture directory was removed.
+
+Known multi-rid fetches now call `Table::get_many` at depth 16 in chunks of 4,096. One-row chunks stay on `Table::get`. That covers read-only and mutable index lookups, both unique range scans, the mutable non-unique range, expression-index full rows, residual rows that already passed the projected check, nested index probes, and update/delete discovery. `try_bounded_index_page` is unchanged. Equivalence tests passed (13 and 4). Clippy `-D warnings` passed.
 
 ## Rules for the push
 

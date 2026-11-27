@@ -1,0 +1,84 @@
+{
+  "compression_disabled": false,
+  "filesystem": "ext4",
+  "fixture": "/mnt/models/powdb-grade-q1/.tmplL7vm8",
+  "heap_bytes": 33558528,
+  "observations": [
+    {
+      "case": "readonly_unique_range",
+      "cold": true,
+      "device_read_bytes": {
+        "nvme0n1": 33554432,
+        "nvme1n1": 0
+      },
+      "elapsed_us": 40651.193,
+      "physical_read_bytes": 33554432,
+      "rows_verified": 8192,
+      "sample": 0
+    },
+    {
+      "case": "readonly_unique_range",
+      "cold": true,
+      "device_read_bytes": {
+        "nvme0n1": 33554432,
+        "nvme1n1": 0
+      },
+      "elapsed_us": 40108.545000000006,
+      "physical_read_bytes": 33554432,
+      "rows_verified": 8192,
+      "sample": 1
+    },
+    {
+      "case": "readonly_unique_range",
+      "cold": true,
+      "device_read_bytes": {
+        "nvme0n1": 33554432,
+        "nvme1n1": 0
+      },
+      "elapsed_us": 45502.988,
+      "physical_read_bytes": 33554432,
+      "rows_verified": 8192,
+      "sample": 2
+    },
+    {
+      "case": "readonly_unique_range",
+      "cold": true,
+      "device_read_bytes": {
+        "nvme0n1": 33554432,
+        "nvme1n1": 0
+      },
+      "elapsed_us": 43656.326,
+      "physical_read_bytes": 33554432,
+      "rows_verified": 8192,
+      "sample": 3
+    },
+    {
+      "case": "readonly_unique_range",
+      "cold": true,
+      "device_read_bytes": {
+        "nvme0n1": 33554432,
+        "nvme1n1": 0
+      },
+      "elapsed_us": 37114.934,
+      "physical_read_bytes": 33554432,
+      "rows_verified": 8192,
+      "sample": 4
+    },
+    {
+      "case": "readonly_unique_range",
+      "cold": false,
+      "device_read_bytes": {
+        "nvme0n1": 0,
+        "nvme1n1": 0
+      },
+      "elapsed_us": 18955.243,
+      "physical_read_bytes": 0,
+      "rows_verified": 8192,
+      "sample": 5
+    }
+  ],
+  "payload_bytes": 2048,
+  "probe": "cold-query-probe",
+  "query": "Gather filter .rk >= 0",
+  "rows": 8192
+}
