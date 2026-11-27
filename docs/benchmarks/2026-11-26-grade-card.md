@@ -91,6 +91,20 @@ Evidence: `docs/benchmarks/2026-11-26-library-window128.json`, ext4 on `nvme0n1`
 
 The assigned grade stays 7.5. The checksum of 128 KiB is shorter than one device round trip, so the next read does not stay ahead, and the extra reads slow the warm pass past its cap. Do not try another window of that size. Do not retune 1.25.
 
+## Ext4 library run, 8 MiB prefetch
+
+Evidence: `docs/benchmarks/2026-11-26-library-prefetch.json`, ext4 on `nvme0n1`, commit `a3a7aa7`. A run longer than 8 MiB is read in 8 MiB windows. Before the checksum, the next window is hinted with `POSIX_FADV_WILLNEED`. The fixture directory was removed. Every timed call matched. Warm samples moved 0 bytes. Cold sequential samples moved exactly 67,112,960 bytes, so the hint did not read the file twice.
+
+| Id | Result | 9.2 |
+| --- | --- | --- |
+| R1 | Depth 1 median 133.4 ms. Depth 16 median 15.8 ms (8.46×). Device bytes 5.0% to 5.6% over 16 MiB. | Met |
+| S1 | Cold depth 1 median 27.6 ms, warm 21.9 ms, ratio 1.26. Every warm sample is above 21.4 ms (21.8 ms to 22.1 ms). Device bytes equal the file. | Not met |
+| F1 | Serial reread 4.5 ms, one pass 1.2 ms (26% of the reread). Process bytes 192,512 on both. | Met |
+| I1 | Every timed call matched. The long-run, gapped, duplicate, and corrupt-page tests passed. | Met |
+| P1 | `read_page` is still one pread. Storage library tests: 277 passed, 1 ignored. Clippy `-D warnings` passed. | Met |
+
+The assigned grade stays 7.5. Cold is 0.8 ms faster than the single `pread` of the whole file, and warm is 2.7 ms slower, which is why the ratio fell from 1.48 to 1.26. The hint did not hide the device read behind the checksum. The window code is not kept. Do not retune 1.25. Do not try a third window size.
+
 ## Rules for the push
 
 - Side branch only. Do not merge to `main` and do not push unless Kirby asks.
