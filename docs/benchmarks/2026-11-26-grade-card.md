@@ -201,6 +201,20 @@ Evidence: `docs/benchmarks/2026-11-27-scan-compare.json`, ext4 on `nvme0n1`, bin
 
 The median scan is 20.0 ms. The median one-pread batch is 23.1 ms. Scan is faster on every run. Do not send `HeapFile::scan` through one `pread` of the file. This comparison is not an S1 sample. The graded sequential path is still `read_pages_verified`. The assigned grade stays 7.5.
 
+## Ext4 library run, page at a time without the copy
+
+Evidence: `docs/benchmarks/2026-11-27-library-page-verify.json`, ext4 on `nvme0n1`, commit `3d5406c`. Same fixture: 16,384 rows, 16,385 pages, 67,112,960 bytes, 7 samples, `posix_fadvise(DONTNEED)`, no `drop_caches`, no `O_DIRECT`. A run longer than 32 pages is `read_page` plus `Page::verify_bytes` per page. The 2026-11-26 page-at-a-time run copied each page and landed at cold 32.9 ms, warm 24.9 ms. The fixture directory was removed. Every timed call matched. Warm samples moved 0 bytes. Cold sequential samples moved exactly 67,112,960 bytes on the process counter and on `nvme0n1`.
+
+| Id | Result | 9.2 |
+| --- | --- | --- |
+| R1 | Depth 1 median 133.1 ms. Depth 16 median 15.8 ms (8.44×). Device bytes 4.9% to 6.2% over 16 MiB. | Met |
+| S1 | Cold depth 1 median 34.1 ms, warm 24.2 ms, ratio 1.41. Every warm sample is 24.0 ms to 25.4 ms, over 21.4 ms. Device bytes equal the file. | Not met |
+| F1 | Serial reread 5.1 ms, one pass 1.2 ms (24% of the reread). Process bytes 192,512 on both. | Met |
+| I1 | Every timed call matched. A 40-page run matches serial reads, and a corrupt middle page is refused. | Met |
+| P1 | `read_page` is still one pread. | Met |
+
+The assigned grade stays 7.5. Dropping the page copy did not make this shape match `HeapFile::scan`. Cold is worse than one `pread` (28.3 ms) and warm is over its cap. The batch reader is one `pread` per contiguous run again. Do not retune 1.25.
+
 ## Rules for the push
 
 - Side branch only. Do not merge to `main` and do not push unless Kirby asks.

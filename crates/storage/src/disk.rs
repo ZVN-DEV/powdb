@@ -243,14 +243,9 @@ impl DiskManager {
 /// `depth` must be nonzero. Depth one is a serial loop; higher depths use at
 /// most `depth` scoped threads sharing the positioned-I/O disk handle. Each
 /// thread groups its slice into maximal runs of ids where each id is exactly
-/// one greater than the previous. A run of 2 to 32 pages is one positioned
-/// read. A longer run is [`DiskManager::read_page`] per page, which is the
-/// shape `HeapFile::scan` uses. On 2026-11-27 that scan was faster cold
-/// (median 20.0 ms) than one pread of the same file (median 23.1 ms). An
-/// earlier page-at-a-time batch read copied each page and missed. This path
-/// checks with [`Page::verify_bytes`] and does not copy. A single page stays
-/// [`DiskManager::read_page`]. A gap, a duplicate, or a decreasing id is not
-/// coalesced. This is opt-in and
+/// one greater than the previous. A longer run is one positioned read of
+/// `run_len * PAGE_SIZE` bytes; a single page stays [`DiskManager::read_page`].
+/// A gap, a duplicate, or a decreasing id is not coalesced. This is opt-in and
 /// does not change [`DiskManager::read_page`] or heap point reads. Checksums
 /// follow [`Page::verify_bytes`]'s validate-if-present policy: the check does
 /// not copy the page. Any read, verification, or worker error fails the whole
@@ -327,10 +322,6 @@ fn read_pages_in_chunks(
     Ok(pages)
 }
 
-// 32 pages is 128 KiB, one device transfer. Longer runs are read a page at
-// a time. The 2026-11-26 page-at-a-time miss copied each page into a `Page`.
-const ONE_TRANSFER_PAGES: usize = 32;
-
 // Maximal runs: each id is exactly one greater than the previous. A gap, a
 // duplicate, or a decrease starts a new run. `checked_add` refuses a wrap
 // from `u32::MAX` to 0, which is not contiguous on disk.
@@ -346,15 +337,10 @@ fn verify_contiguous_runs(
         let start_id = run[0];
         let slots = &mut output[filled..filled + run.len()];
         filled += run.len();
-        if run.len() == 1 || run.len() > ONE_TRANSFER_PAGES {
-            // Long runs follow the scan shape: one pread per page so the
-            // checksum can overlap kernel readahead. Short multi-page runs
-            // stay one positioned read below.
-            for (offset, page_id) in run.iter().enumerate() {
-                let bytes = disk.read_page(*page_id)?;
-                Page::verify_bytes(&bytes).map_err(io::Error::from)?;
-                slots[offset] = bytes;
-            }
+        if run.len() == 1 {
+            let bytes = disk.read_page(start_id)?;
+            Page::verify_bytes(&bytes).map_err(io::Error::from)?;
+            slots[0] = bytes;
         } else {
             disk.read_contiguous_into(start_id, slots)?;
             for page in slots.iter() {
@@ -434,31 +420,6 @@ mod tests {
                     .kind(),
                 io::ErrorKind::UnexpectedEof
             );
-        }
-    }
-
-    #[test]
-    fn batch_long_run_matches_serial_and_refuses_a_middle_page() {
-        // 40 pages is past ONE_TRANSFER_PAGES, so the run is one read_page each.
-        let dir = tempfile::tempdir().unwrap();
-        let mut disk = DiskManager::create(&dir.path().join("long.heap")).unwrap();
-        for _ in 0..40 {
-            let id = disk.allocate_page().unwrap();
-            let mut page = Page::new(id, PageType::Data);
-            page.insert(&id.to_le_bytes()).unwrap();
-            page.stamp_checksum();
-            disk.write_page(id, page.as_bytes()).unwrap();
-        }
-        let ids: Vec<u32> = (0..40).collect();
-        let expected: Vec<_> = ids.iter().map(|&id| disk.read_page(id).unwrap()).collect();
-        for depth in [1, 4] {
-            assert_eq!(read_pages_verified(&disk, &ids, depth).unwrap(), expected);
-        }
-        let mut bytes = disk.read_page(20).unwrap();
-        bytes[100] ^= 1;
-        disk.write_page(20, &bytes).unwrap();
-        for depth in [1, 4] {
-            assert!(read_pages_verified(&disk, &ids, depth).is_err());
         }
     }
 
