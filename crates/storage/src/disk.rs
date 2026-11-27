@@ -243,10 +243,13 @@ impl DiskManager {
 /// `depth` must be nonzero. Depth one is a serial loop; higher depths use at
 /// most `depth` scoped threads sharing the positioned-I/O disk handle. Each
 /// thread groups its slice into maximal runs of ids where each id is exactly
-/// one greater than the previous. A longer run is one positioned read of
-/// `run_len * PAGE_SIZE` bytes; a single page stays [`DiskManager::read_page`].
-/// A gap, a duplicate, or a decreasing id is not coalesced. This is opt-in and
-/// does not change [`DiskManager::read_page`] or heap point reads. Checksums
+/// one greater than the previous. A longer run is read in windows of
+/// [`COALESCED_WINDOW_PAGES`] pages. Each window is one positioned read, then
+/// that window is verified before the next window is read, so checksum work
+/// can overlap the kernel fetching the rest of the run. A single page stays
+/// [`DiskManager::read_page`]. A gap, a duplicate, or a decreasing id is not
+/// coalesced. This is opt-in and does not change [`DiskManager::read_page`]
+/// or heap point reads. Checksums
 /// follow [`Page::from_bytes_verified`]'s validate-if-present policy. Any read,
 /// verification, or worker error fails the whole batch. No partial output is
 /// returned. Callers must keep the underlying file quiescent if they need the
@@ -322,9 +325,17 @@ fn read_pages_in_chunks(
     Ok(pages)
 }
 
+// 32 * 4 KiB = 128 KiB, one transfer on an NVMe whose max_sectors_kb is 128.
+// A whole-file pread returns only after every byte is in, so CRC cannot
+// overlap the device. Sequential windows leave the kernel free to read
+// ahead during the check. A different size is a different mechanism.
+const COALESCED_WINDOW_PAGES: usize = 32;
+
 // Maximal runs: each id is exactly one greater than the previous. A gap, a
 // duplicate, or a decrease starts a new run. `checked_add` refuses a wrap
-// from `u32::MAX` to 0, which is not contiguous on disk.
+// from `u32::MAX` to 0, which is not contiguous on disk. A run longer than
+// [`COALESCED_WINDOW_PAGES`] is several windows, each verified before the
+// next read.
 fn verify_contiguous_runs(
     disk: &DiskManager,
     ids: &[u32],
@@ -334,17 +345,19 @@ fn verify_contiguous_runs(
     let mut filled = 0;
     for run in ids.chunk_by(|prev, next| prev.checked_add(1) == Some(*next)) {
         debug_assert!(!run.is_empty());
-        let start_id = run[0];
-        let slots = &mut output[filled..filled + run.len()];
-        filled += run.len();
-        if run.len() == 1 {
-            let bytes = disk.read_page(start_id)?;
-            Page::from_bytes_verified(&bytes).map_err(io::Error::from)?;
-            slots[0] = bytes;
-        } else {
-            disk.read_contiguous_into(start_id, slots)?;
-            for page in slots.iter() {
-                Page::from_bytes_verified(page).map_err(io::Error::from)?;
+        for window in run.chunks(COALESCED_WINDOW_PAGES) {
+            let start_id = window[0];
+            let slots = &mut output[filled..filled + window.len()];
+            filled += window.len();
+            if window.len() == 1 {
+                let bytes = disk.read_page(start_id)?;
+                Page::from_bytes_verified(&bytes).map_err(io::Error::from)?;
+                slots[0] = bytes;
+            } else {
+                disk.read_contiguous_into(start_id, slots)?;
+                for page in slots.iter() {
+                    Page::from_bytes_verified(page).map_err(io::Error::from)?;
+                }
             }
         }
     }
@@ -401,6 +414,25 @@ mod tests {
             for depth in [1, 4] {
                 assert_eq!(read_pages_verified(&disk, ids, depth).unwrap(), expected);
             }
+        }
+    }
+
+    #[test]
+    fn batch_long_contiguous_run_matches_serial_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut disk = DiskManager::create(&dir.path().join("long.heap")).unwrap();
+        let count = COALESCED_WINDOW_PAGES * 2 + 3;
+        for _ in 0..count {
+            let id = disk.allocate_page().unwrap();
+            let mut page = Page::new(id, PageType::Data);
+            page.insert(&id.to_le_bytes()).unwrap();
+            page.stamp_checksum();
+            disk.write_page(id, page.as_bytes()).unwrap();
+        }
+        let ids: Vec<u32> = (0..count as u32).collect();
+        let expected: Vec<_> = ids.iter().map(|&id| disk.read_page(id).unwrap()).collect();
+        for depth in [1, 4] {
+            assert_eq!(read_pages_verified(&disk, &ids, depth).unwrap(), expected);
         }
     }
 
