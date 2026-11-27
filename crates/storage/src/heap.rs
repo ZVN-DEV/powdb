@@ -1680,20 +1680,21 @@ impl HeapFile {
                 continue;
             }
             let bytes = &by_id[&rid.page_id];
-            // `read_pages_verified` already ran the CRC. `from_bytes` only
-            // rebuilds the page so the slot can be copied.
-            let page = Page::from_bytes(bytes).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "verified page bytes would not parse",
-                )
-            })?;
-            match page.get(rid.slot_index) {
-                Some(row) => {
-                    validate_row_format(row)?;
-                    out.push(Some(row.to_vec()));
+            // `read_pages_verified` already ran the CRC. Same slot read as
+            // the mmap point-read: the count check, then the row bytes,
+            // with no `Page` copy. `slot_bytes_from_page` does not check
+            // the count itself, and a slot past the recorded count would
+            // otherwise read a wild directory entry.
+            if rid.slot_index >= crate::page::slot_count_from_page(bytes) {
+                out.push(None);
+            } else {
+                match crate::page::slot_bytes_from_page(bytes, rid.slot_index) {
+                    Some(row) => {
+                        validate_row_format(row)?;
+                        out.push(Some(row.to_vec()));
+                    }
+                    None => out.push(None),
                 }
-                None => out.push(None),
             }
         }
         Ok(out)
@@ -2220,8 +2221,10 @@ impl HeapFile {
     /// was a syscall pair we paid on every read query.
     ///
     /// Fail-closed (scan-corruption fix): the per-page-read fallback
-    /// propagates read errors and verifies pages via
-    /// [`Page::from_bytes_verified`] instead of silently skipping a page it
+    /// propagates read errors, checks each page with [`Page::verify_bytes`]
+    /// (the gate inside [`Page::from_bytes_verified`], which `ensure_hot`
+    /// applies to point reads), and walks it with [`iter_page_slots`]
+    /// without copying the page, instead of silently skipping a page it
     /// cannot read (see `tests/scan_corruption.rs`). The mmap paths carry a
     /// different, deliberate contract: every page was verified by
     /// `HeapFile::open`, an I/O error on a mapped page raises SIGBUS (loud,
@@ -2432,8 +2435,8 @@ impl HeapFile {
                 // Fail closed, matching `ensure_hot`: a page that cannot be
                 // read or fails verification is an error, never a skip.
                 let buf = self.disk.read_page(page_id)?;
-                let page = Page::from_bytes_verified(&buf).map_err(io::Error::from)?;
-                for (slot, data) in page.iter() {
+                Page::verify_bytes(&buf).map_err(io::Error::from)?;
+                for (slot, data) in iter_page_slots(&buf) {
                     if let ControlFlow::Break(()) = f(
                         RowId {
                             page_id,
@@ -2452,7 +2455,10 @@ impl HeapFile {
     /// Zero-copy scan: calls `f` for every live row without allocating a
     /// `Vec<u8>` per row. Uses the persistent mmap activated by
     /// `enable_mmap()` when available, otherwise falls back to a per-call
-    /// mmap or page-by-page read.
+    /// mmap or page-by-page read. The page-by-page fallback checks each
+    /// page with [`Page::verify_bytes`] and walks it with
+    /// [`iter_page_slots`], without copying the page. A read or
+    /// verification error is returned, never skipped.
     ///
     /// Mission D6: same persistent-mmap fix as `try_for_each_row`.
     ///
@@ -2628,8 +2634,8 @@ impl HeapFile {
                 // Fail closed, matching `ensure_hot`: a page that cannot
                 // be read or fails verification is an error, never a skip.
                 let buf = self.disk.read_page(page_id)?;
-                let page = Page::from_bytes_verified(&buf).map_err(io::Error::from)?;
-                for (slot, data) in page.iter() {
+                Page::verify_bytes(&buf).map_err(io::Error::from)?;
+                for (slot, data) in iter_page_slots(&buf) {
                     f(
                         RowId {
                             page_id,
@@ -2935,6 +2941,61 @@ mod tests {
             }
         }
         assert!(heap.get_many(&[], 16).unwrap().is_empty());
+        drop(heap);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Cold `get_many` matches `get` across more than one data page,
+    /// including a deleted slot and a slot index past the directory.
+    #[test]
+    fn get_many_matches_get_on_a_cold_multipage_heap() {
+        let (mut heap, path) = temp_heap("get_many_multipage");
+        let schema = user_schema();
+        let mut rids = Vec::new();
+        let mut i = 0i64;
+        while heap.num_pages() < 3 {
+            let row = encode_row(
+                &schema,
+                &[Value::Str(format!("user_{i:04}")), Value::Int(i)],
+            );
+            rids.push(heap.insert(&row).unwrap());
+            i += 1;
+            assert!(i < 10_000, "rows never spanned a second data page");
+        }
+        assert!(rids.len() > 2, "a data page holds more than one row");
+        let deleted = rids[1];
+        heap.delete(deleted).unwrap();
+        let live_early = rids[0];
+        let live_late = *rids.last().unwrap();
+        assert_ne!(
+            live_early.page_id, live_late.page_id,
+            "the heap must cover two data pages"
+        );
+        let oversized = RowId {
+            page_id: live_late.page_id,
+            slot_index: u16::MAX,
+        };
+        heap.flush_all_dirty().unwrap();
+        drop(heap);
+
+        let heap = HeapFile::open(&path).unwrap();
+        assert!(heap.num_pages() >= 3);
+        let query = vec![live_late, deleted, live_early, oversized, live_late];
+        for depth in [1_usize, 16] {
+            let many = heap.get_many(&query, depth).unwrap();
+            assert_eq!(many.len(), query.len());
+            for (rid, got) in query.iter().zip(many) {
+                assert_eq!(
+                    got,
+                    heap.get(*rid).unwrap(),
+                    "mismatch at {rid:?} depth {depth}"
+                );
+            }
+        }
+        assert!(heap.get(deleted).unwrap().is_none());
+        assert!(heap.get(oversized).unwrap().is_none());
+        assert!(heap.get(live_early).unwrap().is_some());
+        assert!(heap.get(live_late).unwrap().is_some());
         drop(heap);
         let _ = std::fs::remove_file(path);
     }

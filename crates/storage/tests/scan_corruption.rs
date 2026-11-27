@@ -12,7 +12,8 @@
 //! via a point lookup errored. "Silently missing rows" is the exact defect
 //! class this project treats as P0, so scans now hold the same
 //! fail-closed contract as `ensure_hot`: `read_page` errors and
-//! `Page::from_bytes_verified` refusals surface as `io::Error`
+//! `Page::verify_bytes` refusals (the gate inside
+//! `Page::from_bytes_verified`) surface as `io::Error`
 //! (`StorageError::PageCorrupt`), never as a shorter result.
 //!
 //! The mmap fast paths are deliberately out of scope here: pages were
