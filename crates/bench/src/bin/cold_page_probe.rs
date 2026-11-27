@@ -154,7 +154,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "drop_caches": false,
             "o_direct": false,
             "io_uring": false,
-            "queue_depth": "sequential_distinct at every depth, including depth 1: powdb_storage::disk::read_pages_verified (one pread per contiguous run). random_distinct depth 1, fanout_serial_reread, and fanout_packet: serial DiskManager::read_page. random_distinct depth >1: read_pages_verified",
+            "queue_depth": "sequential_distinct at every depth, including depth 1: powdb_storage::disk::read_pages_verified. A contiguous run longer than 32 pages is read_page per page with Page::verify_bytes. Shorter runs are one pread. random_distinct depth 1, fanout_serial_reread, and fanout_packet: serial DiskManager::read_page. random_distinct depth >1: read_pages_verified",
             "heap_reopened_after_eviction": false,
             "checksum": "read_pages_verified checks with Page::verify_bytes in place. The read_page path still uses Page::from_bytes_verified",
             "why_not_heap_open": "HeapFile::open reads every page while discovering free space",
