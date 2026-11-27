@@ -538,11 +538,6 @@ impl Engine {
         if self.generic_path_forced("project-filter-sort-limit") {
             return Ok(None);
         }
-        // Overflow safety (P0-4): raw-byte scan drops/wraps >= 64KB values;
-        // let the decoded generic path handle v2-capable tables.
-        if self.catalog.table_has_overflow(table) {
-            return Ok(None);
-        }
         if limit == 0 {
             // Degenerate case — empty result. Let the generic path handle it
             // for proper column naming.
@@ -617,6 +612,30 @@ impl Engine {
             },
             None => None,
         };
+
+        // v1 sort-key offsets below are wrong once an overflow bitmap is
+        // present, and a short slice would drop the row. Variable-length
+        // predicates stay generic: the compiled v2 fallback treats a stub
+        // as Empty.
+        if self.catalog.table_has_overflow(table) {
+            if let Some(pred) = predicate {
+                if expr_forces_generic_on_overflow(pred, &schema) {
+                    return Ok(None);
+                }
+            }
+            return self.project_filter_sort_limit_overflow(OverflowSort {
+                table,
+                schema: &schema,
+                row_layout: &row_layout,
+                proj_indices: &proj_indices,
+                proj_columns,
+                sort_idx,
+                descending,
+                limit,
+                prealloc,
+                compiled_pred,
+            });
+        }
 
         // Bounded top-N heap. For `order .x desc limit N`, we want the N
         // largest values — use a min-heap so the smallest is at the top and
@@ -817,6 +836,201 @@ impl Engine {
             rows,
         }))
     }
+
+    /// Top-N over a table that has spilled.
+    ///
+    /// Ranks raw on-disk bytes with [`decode_column`] and fetches an overflow
+    /// chain only for a projected column of a winning row. An unprojected
+    /// chain is never read, so a corrupt one does not drop the row or fail
+    /// the query. A corrupt chain on a projected winner is an error, not an
+    /// empty cell.
+    fn project_filter_sort_limit_overflow(
+        &self,
+        spec: OverflowSort<'_>,
+    ) -> Result<Option<QueryResult>, QueryError> {
+        let drained = match spec.schema.columns[spec.sort_idx].type_id {
+            TypeId::Int => self.collect_keyed_topn(&spec, |value| match value {
+                Value::Empty => None,
+                Value::Int(key) => Some(*key),
+                _ => unreachable!("int sort key"),
+            })?,
+            TypeId::Float => self.collect_keyed_topn(&spec, |value| match value {
+                Value::Empty => None,
+                Value::Float(key) => Some(f64_bits_to_sortable_u64(key.to_bits())),
+                _ => unreachable!("float sort key"),
+            })?,
+            _ => unreachable!("type guard above restricts to Int/Float"),
+        };
+
+        let table = self
+            .catalog
+            .get_table(spec.table)
+            .ok_or_else(|| QueryError::TableNotFound(spec.table.to_string()))?;
+        let heap = &table.heap;
+        let mut cancel = CancelCheck::new();
+        let mut rows = Vec::with_capacity(drained.len());
+        for data in &drained {
+            cancel.tick()?;
+            let mut row = Vec::with_capacity(spec.proj_indices.len());
+            for &column in spec.proj_indices {
+                row.push(decode_projected_column(
+                    spec.schema,
+                    spec.row_layout,
+                    data,
+                    column,
+                    |stub| heap.read_overflow_value(stub),
+                )?);
+            }
+            rows.push(row);
+        }
+        Ok(Some(QueryResult::Rows {
+            columns: spec.proj_columns,
+            rows,
+        }))
+    }
+
+    /// One pass over raw slots. `classify` returns `None` for the null bucket
+    /// and `Some` for an Int or sortable-float key. No per-row poll unless a
+    /// cancellation token is installed. A fired token returns that error
+    /// instead of the partial heap. A top-N still visits every row.
+    fn collect_keyed_topn<K, F>(
+        &self,
+        spec: &OverflowSort<'_>,
+        mut classify: F,
+    ) -> Result<Vec<Vec<u8>>, QueryError>
+    where
+        K: Ord + Copy,
+        F: FnMut(&Value) -> Option<K>,
+    {
+        let mut seq: u64 = 0;
+        let mut heap_desc: DescTopN<K> = BinaryHeap::with_capacity(spec.prealloc);
+        let mut heap_asc: BinaryHeap<(K, u64, Vec<u8>)> = BinaryHeap::with_capacity(spec.prealloc);
+        let mut null_rows: Vec<Vec<u8>> = Vec::with_capacity(spec.prealloc);
+        let mut cancel = CancelCheck::new();
+        let mut cancel_err: Option<QueryError> = None;
+        let poll = crate::cancel::has_active_install();
+        self.catalog
+            .try_for_each_on_disk_row(spec.table, |_rid, slot| {
+                if poll {
+                    if let Err(err) = cancel.tick() {
+                        cancel_err = Some(err);
+                        return ControlFlow::Break(());
+                    }
+                }
+                let data = slot.bytes();
+                if let Some(pred) = spec.compiled_pred.as_ref() {
+                    if !pred(data) {
+                        return ControlFlow::Continue(());
+                    }
+                }
+                let decoded = decode_column(spec.schema, spec.row_layout, data, spec.sort_idx);
+                let id = seq;
+                seq += 1;
+                match classify(&decoded) {
+                    None => {
+                        if null_rows.len() < spec.limit {
+                            null_rows.push(data.to_vec());
+                        }
+                    }
+                    Some(key) => offer_topn(
+                        key,
+                        id,
+                        data,
+                        spec.descending,
+                        spec.limit,
+                        &mut heap_desc,
+                        &mut heap_asc,
+                    ),
+                }
+                ControlFlow::Continue(())
+            })
+            .map_err(QueryError::from_storage_io)?;
+        if let Some(err) = cancel_err {
+            return Err(err);
+        }
+        drain_topn(
+            spec.descending,
+            spec.limit,
+            self.query_memory_limit,
+            heap_desc,
+            heap_asc,
+            null_rows,
+        )
+    }
+}
+
+/// Accepted shape for the spilled top-N reader. The caller already rejected
+/// limit 0, a non-field projection, a non-numeric sort key, and a predicate
+/// that did not compile.
+struct OverflowSort<'a> {
+    table: &'a str,
+    schema: &'a Schema,
+    row_layout: &'a RowLayout,
+    proj_indices: &'a [usize],
+    proj_columns: Vec<String>,
+    sort_idx: usize,
+    descending: bool,
+    limit: usize,
+    prealloc: usize,
+    compiled_pred: Option<CompiledPredicate>,
+}
+
+fn offer_topn<K: Ord + Copy>(
+    key: K,
+    id: u64,
+    bytes: &[u8],
+    descending: bool,
+    limit: usize,
+    heap_desc: &mut DescTopN<K>,
+    heap_asc: &mut BinaryHeap<(K, u64, Vec<u8>)>,
+) {
+    if descending {
+        if heap_desc.len() < limit {
+            heap_desc.push(Reverse((key, Reverse(id), bytes.to_vec())));
+        } else if let Some(Reverse((top_key, _, _))) = heap_desc.peek() {
+            if key > *top_key {
+                heap_desc.pop();
+                heap_desc.push(Reverse((key, Reverse(id), bytes.to_vec())));
+            }
+        }
+    } else if heap_asc.len() < limit {
+        heap_asc.push((key, id, bytes.to_vec()));
+    } else if let Some((top_key, _, _)) = heap_asc.peek() {
+        if key < *top_key {
+            heap_asc.pop();
+            heap_asc.push((key, id, bytes.to_vec()));
+        }
+    }
+}
+
+fn drain_topn<K: Ord>(
+    descending: bool,
+    limit: usize,
+    memory_limit: usize,
+    heap_desc: DescTopN<K>,
+    heap_asc: BinaryHeap<(K, u64, Vec<u8>)>,
+    null_rows: Vec<Vec<u8>>,
+) -> Result<Vec<Vec<u8>>, QueryError> {
+    let mut drained: Vec<(K, u64, Vec<u8>)> = if descending {
+        heap_desc
+            .into_iter()
+            .map(|Reverse((key, Reverse(id), data))| (key, id, data))
+            .collect()
+    } else {
+        heap_asc.into_iter().collect()
+    };
+    if descending {
+        cooperative_stable_sort_by(&mut drained, memory_limit, |a, b| {
+            b.0.cmp(&a.0).then(a.1.cmp(&b.1))
+        })?;
+    } else {
+        cooperative_stable_sort_by(&mut drained, memory_limit, |a, b| {
+            a.0.cmp(&b.0).then(a.1.cmp(&b.1))
+        })?;
+    }
+    let mut rows: Vec<Vec<u8>> = drained.into_iter().map(|(_, _, data)| data).collect();
+    rows.extend(null_rows.into_iter().take(limit.saturating_sub(rows.len())));
+    Ok(rows)
 }
 
 /// Decode one projected column from raw on-disk bytes.
