@@ -96,6 +96,12 @@ name = "cold-page-probe"
 path = "src/bin/cold_page_probe.rs"
 test = true
 
+# Cold heap scan versus one batched read of every page. Not part of the criterion gate.
+[[bin]]
+name = "scan-compare"
+path = "src/bin/scan_compare.rs"
+test = false
+
 # One readonly unique-range fetch after heap eviction. Not part of the criterion gate.
 [[bin]]
 name = "cold-query-probe"
