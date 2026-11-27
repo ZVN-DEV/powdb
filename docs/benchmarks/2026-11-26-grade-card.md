@@ -175,6 +175,20 @@ Evidence: `docs/benchmarks/2026-11-27-library-two-half.json`, ext4 on `nvme0n1`,
 
 The assigned grade stays 7.5. Cold matches the one-pread sample (28.3 ms). The second read starts only after the first pread returns, and this disk's readahead has already pulled the rest of the file by then, so the checksum does not overlap the device. Bytes stayed at one pass, so the helper did not read the file twice. Do not retune 1.25.
 
+## Ext4 library run, both halves issued together
+
+Evidence: `docs/benchmarks/2026-11-27-library-both-halves.json`, ext4 on `nvme0n1`, commit `090185c` on `bench/cold-page-reads`. Same fixture: 16,384 rows, 16,385 pages, 67,112,960 bytes, 7 samples, `posix_fadvise(DONTNEED)`, no `drop_caches`, no `O_DIRECT`. A run longer than 32 pages starts both half `pread`s before either checksum. The fixture directory was removed. Every timed call matched. Warm samples moved 0 bytes. Cold sequential samples moved exactly 67,112,960 bytes on the process counter and on `nvme0n1`. `nvme1n1` stayed at 0.
+
+| Id | Result | 9.2 |
+| --- | --- | --- |
+| R1 | Depth 1 median 137.5 ms. Depth 16 median 16.1 ms (8.53×). Device bytes 5.3% to 5.7% over 16 MiB. | Met |
+| S1 | Cold depth 1 median 35.6 ms, warm 16.6 ms, ratio 2.14. Warm median is under 21.4 ms (samples 16.0 ms to 17.0 ms). Device bytes equal the file. Depth 16 was 32.3 ms. | Not met |
+| F1 | Serial reread 5.0 ms, one pass 1.1 ms (22% of the reread). Process bytes 192,512 on both. | Met |
+| I1 | Every timed call matched. The long-run tests still refuse a corrupt page in either half. | Met |
+| P1 | `read_page` is still one pread. | Met |
+
+The assigned grade stays 7.5. Cold is worse than one `pread` (28.3 ms) and the ratio is worse. Warm got faster, which is the same pattern as the 8 MiB pipeline. Overlapping two buffered reads with the checksum does not hide the device time on this machine. Both two-pread schedules are dropped. The reader is one `pread` per contiguous run again, with `Page::verify_bytes`. Do not retune 1.25.
+
 ## Rules for the push
 
 - Side branch only. Do not merge to `main` and do not push unless Kirby asks.
