@@ -119,6 +119,20 @@ Evidence: `docs/benchmarks/2026-11-26-library-stream-hint.json`, ext4 on `nvme0n
 
 The assigned grade stays 7.5. The ratio is under 1.25 because warm got slower, not because cold got faster. Cold is 32.0 ms, worse than the single `pread` at 28.4 ms. `POSIX_FADV_SEQUENTIAL` also stayed set on the heap file and increased later readahead. That hint is not kept. Do not retune 1.25.
 
+## Ext4 library run, page at a time
+
+Evidence: `docs/benchmarks/2026-11-26-library-page-stream.json`, ext4 on `nvme0n1`, commit `5677f07`. A long run is `read_page` and a checksum per page, with no `fadvise`. The fixture directory was removed. Every timed call matched. Warm samples moved 0 bytes. Cold sequential samples moved exactly 67,112,960 bytes. Fanout process bytes are back to 192,512.
+
+| Id | Result | 9.2 |
+| --- | --- | --- |
+| R1 | Depth 1 median 134.3 ms. Depth 16 median 15.6 ms (8.63×). Device bytes 5.2% to 6.1% over 16 MiB. Depth 1 process bytes are 17,854,464 again. | Met |
+| S1 | Cold depth 1 median 32.9 ms, warm 24.9 ms, ratio 1.32. Every warm sample is 24.7 ms to 25.2 ms, over 21.4 ms. Device bytes equal the file. | Not met |
+| F1 | Serial reread 4.6 ms, one pass 1.0 ms (22% of the reread). Process bytes 192,512 on both. | Met |
+| I1 | Every timed call matched. | Met |
+| P1 | `read_page` is still one pread. | Met |
+
+The assigned grade stays 7.5. Reading one page at a time inside `read_pages_verified` is slower than one `pread` of the file (warm 19.2 ms, cold 28.4 ms). Do not retune 1.25.
+
 ## Rules for the push
 
 - Side branch only. Do not merge to `main` and do not push unless Kirby asks.
