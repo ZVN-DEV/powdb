@@ -305,17 +305,27 @@ impl Engine {
                         let rids = tbl.index_lookup_all(column, &key_value);
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
                         let mut cancel = CancelCheck::new();
-                        for rid in rids {
-                            cancel.tick()?;
-                            // Overflow safety (P0-3/P0-4): `tbl.get` reassembles
-                            // spilled columns from their overflow chains. The old
-                            // `heap.get` + `decode_column` read raw v2 bytes and
-                            // returned Empty for a spilled column (or wrapped a
-                            // >= 64KB value).
-                            if let Some(full) = tbl.get(rid).map_err(QueryError::from_storage_io)? {
-                                let row: Vec<Value> =
-                                    proj_indices.iter().map(|&ci| full[ci].clone()).collect();
-                                rows.push(row);
+                        // Overflow safety (P0-3/P0-4): `tbl.get` / `get_many`
+                        // reassemble spilled columns from their overflow chains.
+                        // The old `heap.get` + `decode_column` read raw v2 bytes
+                        // and returned Empty for a spilled column (or wrapped a
+                        // >= 64KB value).
+                        for chunk in rids.chunks(4_096) {
+                            for _ in chunk {
+                                cancel.tick()?;
+                            }
+                            let fetched = if chunk.len() == 1 {
+                                vec![tbl.get(chunk[0]).map_err(QueryError::from_storage_io)?]
+                            } else {
+                                tbl.get_many(chunk, 16)
+                                    .map_err(QueryError::from_storage_io)?
+                            };
+                            for full in fetched {
+                                if let Some(full) = full {
+                                    let row: Vec<Value> =
+                                        proj_indices.iter().map(|&ci| full[ci].clone()).collect();
+                                    rows.push(row);
+                                }
                             }
                         }
                         return Ok(QueryResult::Rows {
@@ -2350,15 +2360,25 @@ impl Engine {
                     let rids = tbl.index_lookup_all(column, &key_value);
                     let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
                     let mut cancel = CancelCheck::new();
-                    for rid in rids {
-                        cancel.tick()?;
-                        #[cfg(feature = "testing")]
-                        crate::executor::work_stats::record_heap_fetch();
-                        // Overflow safety (P0-3/P0-4): `tbl.get` reassembles
-                        // spilled columns; the old `heap.get` + `decode_row`
-                        // returned Empty / wrapped a >= 64KB value.
-                        if let Some(row) = tbl.get(rid).map_err(QueryError::from_storage_io)? {
-                            rows.push(row);
+                    // Overflow safety (P0-3/P0-4): `tbl.get` / `get_many`
+                    // reassemble spilled columns; the old `heap.get` +
+                    // `decode_row` returned Empty / wrapped a >= 64KB value.
+                    for chunk in rids.chunks(4_096) {
+                        for _ in chunk {
+                            cancel.tick()?;
+                            #[cfg(feature = "testing")]
+                            crate::executor::work_stats::record_heap_fetch();
+                        }
+                        let fetched = if chunk.len() == 1 {
+                            vec![tbl.get(chunk[0]).map_err(QueryError::from_storage_io)?]
+                        } else {
+                            tbl.get_many(chunk, 16)
+                                .map_err(QueryError::from_storage_io)?
+                        };
+                        for row in fetched {
+                            if let Some(row) = row {
+                                rows.push(row);
+                            }
                         }
                     }
                     return Ok(QueryResult::Rows { columns, rows });
@@ -2519,6 +2539,7 @@ impl Engine {
                         };
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(hits.len());
                         let mut cancel = CancelCheck::new();
+                        let mut kept: Vec<RowId> = Vec::with_capacity(hits.len());
                         for (key, rid) in hits {
                             cancel.tick()?;
                             if !start_inclusive {
@@ -2535,9 +2556,20 @@ impl Engine {
                                     }
                                 }
                             }
-                            // Overflow safety (P0-3): reassemble spilled cols.
-                            if let Some(row) = tbl.get(rid).map_err(QueryError::from_storage_io)? {
-                                rows.push(row);
+                            kept.push(rid);
+                        }
+                        // Overflow safety (P0-3): `get` / `get_many` reassemble spilled cols.
+                        for chunk in kept.chunks(4_096) {
+                            let fetched = if chunk.len() == 1 {
+                                vec![tbl.get(chunk[0]).map_err(QueryError::from_storage_io)?]
+                            } else {
+                                tbl.get_many(chunk, 16)
+                                    .map_err(QueryError::from_storage_io)?
+                            };
+                            for row in fetched {
+                                if let Some(row) = row {
+                                    rows.push(row);
+                                }
                             }
                         }
                         return Ok(QueryResult::Rows { columns, rows });
@@ -3816,12 +3848,23 @@ impl Engine {
                 if key.type_id() != col_type {
                     continue;
                 }
-                for rid in tbl.index_lookup_all(&nested.child_key, key) {
-                    cancel.tick()?;
-                    // `tbl.get` reassembles spilled/overflow columns and
-                    // tolerates a stale rid (None) like the IndexScan path.
-                    if let Some(row) = tbl.get(rid).map_err(QueryError::from_storage_io)? {
-                        narrow_into(&row, &mut child_rows)?;
+                let rids = tbl.index_lookup_all(&nested.child_key, key);
+                for chunk in rids.chunks(4_096) {
+                    for _ in chunk {
+                        cancel.tick()?;
+                    }
+                    // `get` / `get_many` reassemble spilled/overflow columns
+                    // and tolerate a stale rid (None) like the IndexScan path.
+                    let fetched = if chunk.len() == 1 {
+                        vec![tbl.get(chunk[0]).map_err(QueryError::from_storage_io)?]
+                    } else {
+                        tbl.get_many(chunk, 16)
+                            .map_err(QueryError::from_storage_io)?
+                    };
+                    for row in fetched {
+                        if let Some(row) = row {
+                            narrow_into(&row, &mut child_rows)?;
+                        }
                     }
                 }
             }
