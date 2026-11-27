@@ -264,6 +264,7 @@ pub fn read_pages_verified(
 // The reader seam lets tests count actual calls, including repeated ids, without
 // adding counters or branches to DiskManager's one-page path. It stays one call
 // per id. Coalescing lives in `verify_contiguous_runs`, not here.
+#[cfg(test)]
 fn read_pages_with(
     page_ids: &[u32],
     depth: usize,
