@@ -59,9 +59,23 @@ Depth 1 in this probe is still one `pread` per page (`DiskManager::read_page`). 
 | I1 | Every timed call matched. A corrupt page is refused in `batch_refuses_corrupt_or_missing_pages`. | Met |
 | P1 | `read_page` is still one pread. The storage library suite passed. | Met |
 
-All five bars held on this run. The read-only unique-range fetch above already showed a production multi-page read using `Table::get_many`, which calls this same verified reader. The assigned grade moves to 9.2.
+That S1 mark is the per-page path. The next section times depth 1 through `read_pages_verified` and replaces this score. The assigned grade does not move on this sample.
 
-The earlier ext4 sample missed S1 at ratio 1.26 on the same depth-1 path. This sample of that path is 1.13. Sequential depth 16, which does coalesce, was 21.2 ms, close to depth 1 at 22.2 ms. Kernel readahead already covers sequential 4 KiB reads, so the ratio change is this run's cold and warm pair, not a large change in the depth-1 code.
+The earlier ext4 sample missed S1 at ratio 1.26 on the same depth-1 path. This sample of that path is 1.13. Sequential depth 16, which does coalesce, was 21.2 ms, close to depth 1 at 22.2 ms. Kernel readahead already covers sequential 4 KiB reads, so the ratio change is this run's cold and warm pair, not a change in the depth-1 code.
+
+## Ext4 library run, sequential depth 1 coalesced
+
+Evidence: `docs/benchmarks/2026-11-26-library-seq-depth1.json`, ext4 on `nvme0n1`, commit `b6a402c` on `bench/cold-page-reads`. Same fixture shape: 16,384 rows, 64 MiB heap, 7 samples, `posix_fadvise(DONTNEED)`, no `drop_caches`, no `O_DIRECT`. `sequential_distinct` at every depth, including depth 1, calls `read_pages_verified`. On this file that depth-1 call is one `pread` of all 67,112,960 bytes, then a CRC of every page. Random depth 1 and both fanout cases stay on `read_page`, so R1's baseline and F1's reread are still one `pread` per request. The fixture directory was removed. Every timed call matched its fingerprint. Warm samples moved 0 bytes. Cold sequential samples moved exactly 67,112,960 bytes on the process counter and on `nvme0n1`. `nvme1n1` stayed at 0.
+
+| Id | Result | 9.2 |
+| --- | --- | --- |
+| R1 | Depth 1 median 132.8 ms. Depth 16 median 15.6 ms (8.53×). Device bytes 5.0% to 5.9% over 16 MiB. | Met |
+| S1 | Cold depth 1 median 28.4 ms, warm 19.2 ms, ratio 1.48. Warm is under 21.4 ms. Device bytes equal the file. Depth 16 on the same reader was 22.2 ms. | Not met |
+| F1 | Serial reread 5.0 ms, one pass 1.0 ms (21% of the reread). Process bytes 192,512 on both. | Met |
+| I1 | Every timed call matched. Storage code did not change in this commit, so the earlier corrupt-page refusal still stands. | Met |
+| P1 | `read_page` is still one pread. Storage tests were not re-run for a probe-only change. | Met |
+
+The assigned grade stays 7.5. One `pread` of the whole file returns only after the device has finished, and the CRC starts after that, so the two do not overlap. Do not retune 1.25.
 
 ## Rules for the push
 
