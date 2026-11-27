@@ -2129,13 +2129,15 @@ impl HeapFile {
     /// (same as before — the returned type was already an owned flat_map),
     /// so copying the hot page bytes into the result costs nothing extra.
     ///
-    /// Fail-closed (scan-corruption fix): every page read off the disk goes
-    /// through [`Page::from_bytes_verified`], the same gate `ensure_hot`
-    /// applies to point reads. A page that cannot be read or fails
-    /// verification surfaces as an `Err` item; it used to be silently
-    /// mapped to zero rows, which turned mid-life corruption or an EIO into
-    /// a plausible-but-partial result for index rebuilds, vacuum snapshots,
-    /// and full-table queries. See `tests/scan_corruption.rs`.
+    /// Fail-closed (scan-corruption fix): every clean page read off the disk
+    /// is checked with [`Page::verify_bytes`] (the gate inside
+    /// [`Page::from_bytes_verified`], which `ensure_hot` applies to point
+    /// reads) and walked with [`iter_page_slots`], without copying the page.
+    /// A page that cannot be read or fails verification surfaces as an `Err`
+    /// item; it used to be silently mapped to zero rows, which turned
+    /// mid-life corruption or an EIO into a plausible-but-partial result for
+    /// index rebuilds, vacuum snapshots, and full-table queries. See
+    /// `tests/scan_corruption.rs`.
     /// Whether the heap holds at least one live row. Fail-closed: an
     /// unreadable or unverifiable first page is an error, not "empty" —
     /// callers gate DDL decisions on this answer.
@@ -2181,23 +2183,21 @@ impl HeapFile {
                         ))
                     })
                     .collect(),
-                _ => match self
-                    .disk
-                    .read_page(page_id)
-                    .and_then(|buf| Page::from_bytes_verified(&buf).map_err(io::Error::from))
-                {
-                    Ok(page) => page
-                        .iter()
-                        .map(|(slot, data)| {
-                            Ok((
-                                RowId {
-                                    page_id,
-                                    slot_index: slot,
-                                },
-                                data.to_vec(),
-                            ))
-                        })
-                        .collect(),
+                _ => match self.disk.read_page(page_id) {
+                    Ok(buf) => match Page::verify_bytes(&buf).map_err(io::Error::from) {
+                        Ok(()) => iter_page_slots(&buf)
+                            .map(|(slot, data)| {
+                                Ok((
+                                    RowId {
+                                        page_id,
+                                        slot_index: slot,
+                                    },
+                                    data.to_vec(),
+                                ))
+                            })
+                            .collect(),
+                        Err(e) => vec![Err(e)],
+                    },
                     Err(e) => vec![Err(e)],
                 },
             };
