@@ -161,6 +161,20 @@ Evidence: `docs/benchmarks/2026-11-27-library-verify-bytes.json`, ext4 on `nvme0
 
 The assigned grade stays 7.5. Cold is the same as the copying one-pread sample (28.4 ms). The ratio fell because this warm median is 20.7 ms rather than 19.2 ms, not because the device read got faster. Dropping the unused page copy did not produce the 4.4 ms that only the cold run has to lose. Do not retune 1.25.
 
+## Ext4 library run, second pread after the first returns
+
+Evidence: `docs/benchmarks/2026-11-27-library-two-half.json`, ext4 on `nvme0n1`, commits `74ebfe2` and `c1da0ca` on `bench/cold-page-reads`. Same fixture: 16,384 rows, 16,385 pages, 67,112,960 bytes, 7 samples, `posix_fadvise(DONTNEED)`, no `drop_caches`, no `O_DIRECT`. A run longer than 32 pages reads the first half to completion, then reads the second half on a helper thread while the first half is checksummed. The fixture directory was removed. Every timed call matched. Warm samples moved 0 bytes. Cold sequential samples moved exactly 67,112,960 bytes on the process counter and on `nvme0n1`. `nvme1n1` stayed at 0.
+
+| Id | Result | 9.2 |
+| --- | --- | --- |
+| R1 | Depth 1 median 134.1 ms. Depth 16 median 15.5 ms (8.63×). Device bytes 5.2% to 6.0% over 16 MiB. | Met |
+| S1 | Cold depth 1 median 28.1 ms, warm 20.1 ms, ratio 1.40. Warm median is under 21.4 ms (samples 19.9 ms to 21.0 ms). Device bytes equal the file. Depth 16 on this reader was 24.1 ms, up from 22.0 ms on one pread. | Not met |
+| F1 | Serial reread 5.2 ms, one pass 1.1 ms (21% of the reread). Process bytes 192,512 on both. | Met |
+| I1 | Every timed call matched. The 40-page run matches serial reads, and a corrupt page in either half is refused. Storage library tests: 280 passed, 1 ignored. Scan corruption tests: 3 passed. | Met |
+| P1 | `read_page` is still one pread. | Met |
+
+The assigned grade stays 7.5. Cold matches the one-pread sample (28.3 ms). The second read starts only after the first pread returns, and this disk's readahead has already pulled the rest of the file by then, so the checksum does not overlap the device. Bytes stayed at one pass, so the helper did not read the file twice. Do not retune 1.25.
+
 ## Rules for the push
 
 - Side branch only. Do not merge to `main` and do not push unless Kirby asks.
