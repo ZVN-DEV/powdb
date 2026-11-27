@@ -196,6 +196,19 @@ impl DiskManager {
         Ok(buf)
     }
 
+    /// Read `pages.len()` contiguous pages starting at `start_id` in one
+    /// positioned read.
+    ///
+    /// The offset is `start_id * PAGE_SIZE`, the same formula as
+    /// [`Self::read_page`]. The slots are contiguous `[u8; PAGE_SIZE]` values,
+    /// so the read is one `pages.len() * PAGE_SIZE` byte buffer which is
+    /// already split into pages. A short read is `UnexpectedEof`, from the
+    /// same helper `read_page` uses.
+    fn read_contiguous_into(&self, start_id: u32, pages: &mut [[u8; PAGE_SIZE]]) -> io::Result<()> {
+        let offset = start_id as u64 * PAGE_SIZE as u64;
+        read_exact_at(&self.file, pages.as_flattened_mut(), offset)
+    }
+
     pub fn flush(&mut self) -> io::Result<()> {
         if self.read_only {
             // Nothing was written, so there is nothing to sync. Returning Ok
@@ -228,30 +241,46 @@ impl DiskManager {
 /// Read and verify every requested page, preserving request order and duplicates.
 ///
 /// `depth` must be nonzero. Depth one is a serial loop; higher depths use at
-/// most `depth` scoped threads sharing the positioned-I/O disk handle. This is
-/// opt-in and does not change [`DiskManager::read_page`] or heap point reads.
-/// Checksums follow [`Page::from_bytes_verified`]'s validate-if-present policy.
-/// Any read, verification, or worker error fails the whole batch. No partial
-/// output is returned. Callers must keep the underlying file quiescent if they
-/// need the batch to represent one consistent snapshot.
+/// most `depth` scoped threads sharing the positioned-I/O disk handle. Each
+/// thread groups its slice into maximal runs of ids where each id is exactly
+/// one greater than the previous. A longer run is one positioned read of
+/// `run_len * PAGE_SIZE` bytes; a single page stays [`DiskManager::read_page`].
+/// A gap, a duplicate, or a decreasing id is not coalesced. This is opt-in and
+/// does not change [`DiskManager::read_page`] or heap point reads. Checksums
+/// follow [`Page::from_bytes_verified`]'s validate-if-present policy. Any read,
+/// verification, or worker error fails the whole batch. No partial output is
+/// returned. Callers must keep the underlying file quiescent if they need the
+/// batch to represent one consistent snapshot.
 pub fn read_pages_verified(
     disk: &DiskManager,
     page_ids: &[u32],
     depth: usize,
 ) -> io::Result<Vec<[u8; PAGE_SIZE]>> {
-    read_pages_with(page_ids, depth, &|page_id| {
-        let bytes = disk.read_page(page_id)?;
-        Page::from_bytes_verified(&bytes).map_err(io::Error::from)?;
-        Ok(bytes)
+    read_pages_in_chunks(page_ids, depth, &|ids, output| {
+        verify_contiguous_runs(disk, ids, output)
     })
 }
 
 // The reader seam lets tests count actual calls, including repeated ids, without
-// adding counters or branches to DiskManager's one-page path.
+// adding counters or branches to DiskManager's one-page path. It stays one call
+// per id. Coalescing lives in `verify_contiguous_runs`, not here.
 fn read_pages_with(
     page_ids: &[u32],
     depth: usize,
     read: &(impl Fn(u32) -> io::Result<[u8; PAGE_SIZE]> + Sync),
+) -> io::Result<Vec<[u8; PAGE_SIZE]>> {
+    read_pages_in_chunks(page_ids, depth, &|ids, output| {
+        for (&page_id, slot) in ids.iter().zip(output) {
+            *slot = read(page_id)?;
+        }
+        Ok(())
+    })
+}
+
+fn read_pages_in_chunks(
+    page_ids: &[u32],
+    depth: usize,
+    fill: &(impl Fn(&[u32], &mut [[u8; PAGE_SIZE]]) -> io::Result<()> + Sync),
 ) -> io::Result<Vec<[u8; PAGE_SIZE]>> {
     if depth == 0 {
         return Err(io::Error::new(
@@ -259,17 +288,14 @@ fn read_pages_with(
             "page read depth must be nonzero",
         ));
     }
-    if depth == 1 {
-        let mut pages = Vec::with_capacity(page_ids.len());
-        for &page_id in page_ids {
-            pages.push(read(page_id)?);
-        }
-        return Ok(pages);
-    }
     if page_ids.is_empty() {
         return Ok(Vec::new());
     }
     let mut pages = vec![[0; PAGE_SIZE]; page_ids.len()];
+    if depth == 1 {
+        fill(page_ids, &mut pages)?;
+        return Ok(pages);
+    }
     let chunk_size = page_ids.len().div_ceil(depth.min(page_ids.len()));
     std::thread::scope(|scope| {
         let mut joins = Vec::new();
@@ -277,12 +303,7 @@ fn read_pages_with(
             .chunks(chunk_size)
             .zip(pages.chunks_mut(chunk_size))
         {
-            joins.push(scope.spawn(move || -> io::Result<()> {
-                for (&page_id, slot) in ids.iter().zip(output) {
-                    *slot = read(page_id)?;
-                }
-                Ok(())
-            }));
+            joins.push(scope.spawn(move || -> io::Result<()> { fill(ids, output) }));
         }
         // Join every worker even on error so no unjoined panic escapes scope.
         let mut result = Ok(());
@@ -298,6 +319,36 @@ fn read_pages_with(
         result
     })?;
     Ok(pages)
+}
+
+// Maximal runs: each id is exactly one greater than the previous. A gap, a
+// duplicate, or a decrease starts a new run. `checked_add` refuses a wrap
+// from `u32::MAX` to 0, which is not contiguous on disk.
+fn verify_contiguous_runs(
+    disk: &DiskManager,
+    ids: &[u32],
+    output: &mut [[u8; PAGE_SIZE]],
+) -> io::Result<()> {
+    debug_assert_eq!(ids.len(), output.len());
+    let mut filled = 0;
+    for run in ids.chunk_by(|prev, next| prev.checked_add(1) == Some(*next)) {
+        debug_assert!(!run.is_empty());
+        let start_id = run[0];
+        let slots = &mut output[filled..filled + run.len()];
+        filled += run.len();
+        if run.len() == 1 {
+            let bytes = disk.read_page(start_id)?;
+            Page::from_bytes_verified(&bytes).map_err(io::Error::from)?;
+            slots[0] = bytes;
+        } else {
+            disk.read_contiguous_into(start_id, slots)?;
+            for page in slots.iter() {
+                Page::from_bytes_verified(page).map_err(io::Error::from)?;
+            }
+        }
+    }
+    debug_assert_eq!(filled, ids.len());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -336,6 +387,20 @@ mod tests {
             read_pages_verified(&disk, &ids, 0).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn batch_contiguous_and_gapped_match_serial_reads() {
+        let (_dir, disk) = batch_fixture();
+        let contiguous = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+        // Gap before 4, duplicate 5, then a decreasing id. None of those join.
+        let gapped = [0, 1, 2, 4, 5, 5, 8, 3];
+        for ids in [&contiguous[..], &gapped[..]] {
+            let expected: Vec<_> = ids.iter().map(|&id| disk.read_page(id).unwrap()).collect();
+            for depth in [1, 4] {
+                assert_eq!(read_pages_verified(&disk, ids, depth).unwrap(), expected);
+            }
+        }
     }
 
     #[test]
