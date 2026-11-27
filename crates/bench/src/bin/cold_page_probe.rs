@@ -154,7 +154,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "drop_caches": false,
             "o_direct": false,
             "io_uring": false,
-            "queue_depth": "sequential_distinct at every depth, including depth 1: powdb_storage::disk::read_pages_verified. A run longer than one 128 KiB transfer is read_page plus checksum per page, so checksum overlaps kernel readahead. A shorter run is one pread. random_distinct depth 1, fanout_serial_reread, and fanout_packet: serial DiskManager::read_page. random_distinct depth >1: read_pages_verified",
+            "queue_depth": "sequential_distinct at every depth, including depth 1: powdb_storage::disk::read_pages_verified. A run longer than 8 MiB keeps one pread in flight and checksums the previous 8 MiB while that read runs. A shorter multi-page run is one pread. random_distinct depth 1, fanout_serial_reread, and fanout_packet: serial DiskManager::read_page. random_distinct depth >1: read_pages_verified",
             "heap_reopened_after_eviction": false,
             "checksum": "Page::from_bytes_verified on every fetched page",
             "why_not_heap_open": "HeapFile::open reads every page while discovering free space",
