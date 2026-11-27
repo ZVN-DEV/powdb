@@ -243,12 +243,14 @@ impl DiskManager {
 /// `depth` must be nonzero. Depth one is a serial loop; higher depths use at
 /// most `depth` scoped threads sharing the positioned-I/O disk handle. Each
 /// thread groups its slice into maximal runs of ids where each id is exactly
-/// one greater than the previous. A longer run is one positioned read of
-/// `run_len * PAGE_SIZE` bytes; a single page stays [`DiskManager::read_page`].
-/// A gap, a duplicate, or a decreasing id is not coalesced. This is opt-in and
-/// does not change [`DiskManager::read_page`] or heap point reads. Checksums
-/// follow [`Page::verify_bytes`]'s validate-if-present policy: the check does
-/// not copy the page. Any read, verification, or worker error fails the whole
+/// one greater than the previous. A run longer than 32 pages is two preads:
+/// the second read overlaps the checksum of the first half. Every shorter run
+/// is one pread, [`DiskManager::read_page`] for a single page and one
+/// contiguous read otherwise. A gap, a duplicate, or a decreasing id is not
+/// coalesced. This is opt-in and does not change
+/// [`DiskManager::read_page`] or heap point reads. Checksums follow
+/// [`Page::verify_bytes`]'s validate-if-present policy: the check does not
+/// copy the page. Any read, verification, or worker error fails the whole
 /// batch. No partial output is returned. Callers must keep the underlying file
 /// quiescent if they need the batch to represent one consistent snapshot.
 pub fn read_pages_verified(
@@ -322,6 +324,53 @@ fn read_pages_in_chunks(
     Ok(pages)
 }
 
+// 32 pages is 128 KiB: one positioned read. A longer run is exactly two reads,
+// not a window loop. The second pread overlaps the first half's checksum.
+const ONE_TRANSFER_PAGES: usize = 32;
+
+fn verify_page_bytes(pages: &[[u8; PAGE_SIZE]]) -> io::Result<()> {
+    for page in pages {
+        Page::verify_bytes(page).map_err(io::Error::from)?;
+    }
+    Ok(())
+}
+
+// Two preads, both halves nonempty (`mid = len / 2`). The caller reads the
+// first half, then one scoped helper reads the second half while the caller
+// checksums the first. Join before touching the second half. `checked_add`
+// is a backstop: `chunk_by` already refuses a wrapping run.
+fn verify_long_run(
+    disk: &DiskManager,
+    start_id: u32,
+    slots: &mut [[u8; PAGE_SIZE]],
+) -> io::Result<()> {
+    let mid = slots.len() / 2;
+    debug_assert!(mid > 0 && mid < slots.len());
+    let (first, second) = slots.split_at_mut(mid);
+    disk.read_contiguous_into(start_id, first)?;
+    let second_start = u32::try_from(mid)
+        .ok()
+        .and_then(|half| start_id.checked_add(half))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "contiguous page run overflows a page id",
+            )
+        })?;
+    std::thread::scope(|scope| {
+        let reader =
+            scope.spawn(|| -> io::Result<()> { disk.read_contiguous_into(second_start, second) });
+        let verified = verify_page_bytes(first);
+        let read = reader
+            .join()
+            .map_err(|_| io::Error::other("page reader thread panicked"))
+            .and_then(|result| result);
+        verified?;
+        read
+    })?;
+    verify_page_bytes(second)
+}
+
 // Maximal runs: each id is exactly one greater than the previous. A gap, a
 // duplicate, or a decrease starts a new run. `checked_add` refuses a wrap
 // from `u32::MAX` to 0, which is not contiguous on disk.
@@ -341,11 +390,11 @@ fn verify_contiguous_runs(
             let bytes = disk.read_page(start_id)?;
             Page::verify_bytes(&bytes).map_err(io::Error::from)?;
             slots[0] = bytes;
-        } else {
+        } else if run.len() <= ONE_TRANSFER_PAGES {
             disk.read_contiguous_into(start_id, slots)?;
-            for page in slots.iter() {
-                Page::verify_bytes(page).map_err(io::Error::from)?;
-            }
+            verify_page_bytes(slots)?;
+        } else {
+            verify_long_run(disk, start_id, slots)?;
         }
     }
     debug_assert_eq!(filled, ids.len());
@@ -362,10 +411,10 @@ mod tests {
         std::env::temp_dir().join(format!("powdb_test_{name}_{}", std::process::id()))
     }
 
-    fn batch_fixture() -> (tempfile::TempDir, DiskManager) {
+    fn batch_fixture_n(pages: u32) -> (tempfile::TempDir, DiskManager) {
         let dir = tempfile::tempdir().unwrap();
         let mut disk = DiskManager::create(&dir.path().join("batch.heap")).unwrap();
-        for _ in 0..9 {
+        for _ in 0..pages {
             let id = disk.allocate_page().unwrap();
             let mut page = Page::new(id, PageType::Data);
             page.insert(&id.to_le_bytes()).unwrap();
@@ -373,6 +422,16 @@ mod tests {
             disk.write_page(id, page.as_bytes()).unwrap();
         }
         (dir, disk)
+    }
+
+    fn batch_fixture() -> (tempfile::TempDir, DiskManager) {
+        batch_fixture_n(9)
+    }
+
+    fn flip_page_byte(disk: &mut DiskManager, page_id: u32) {
+        let mut bytes = disk.read_page(page_id).unwrap();
+        bytes[100] ^= 1;
+        disk.write_page(page_id, &bytes).unwrap();
     }
 
     #[test]
@@ -420,6 +479,39 @@ mod tests {
                     .kind(),
                 io::ErrorKind::UnexpectedEof
             );
+        }
+    }
+
+    #[test]
+    fn batch_long_run_matches_serial_reads() {
+        // 40 pages is past ONE_TRANSFER_PAGES (32), so depth 1 is two preads.
+        let (_dir, disk) = batch_fixture_n(40);
+        let ids: Vec<u32> = (0..40).collect();
+        let expected: Vec<_> = ids.iter().map(|&id| disk.read_page(id).unwrap()).collect();
+        for depth in [1, 4] {
+            assert_eq!(read_pages_verified(&disk, &ids, depth).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn batch_long_run_refuses_corrupt_first_half() {
+        // Page 3 sits in the first half of a 40-page run (mid = 20).
+        let (_dir, mut disk) = batch_fixture_n(40);
+        flip_page_byte(&mut disk, 3);
+        let ids: Vec<u32> = (0..40).collect();
+        for depth in [1, 4] {
+            assert!(read_pages_verified(&disk, &ids, depth).is_err());
+        }
+    }
+
+    #[test]
+    fn batch_long_run_refuses_corrupt_second_half() {
+        // Page 30 sits in the second half of a 40-page run (mid = 20).
+        let (_dir, mut disk) = batch_fixture_n(40);
+        flip_page_byte(&mut disk, 30);
+        let ids: Vec<u32> = (0..40).collect();
+        for depth in [1, 4] {
+            assert!(read_pages_verified(&disk, &ids, depth).is_err());
         }
     }
 
