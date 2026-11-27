@@ -77,6 +77,20 @@ Evidence: `docs/benchmarks/2026-11-26-library-seq-depth1.json`, ext4 on `nvme0n1
 
 The assigned grade stays 7.5. One `pread` of the whole file returns only after the device has finished, and the CRC starts after that, so the two do not overlap. Do not retune 1.25.
 
+## Ext4 library run, 128 KiB windows
+
+Evidence: `docs/benchmarks/2026-11-26-library-window128.json`, ext4 on `nvme0n1`, commit `5524ca5`. Same probe as the section above. A contiguous run is now read 32 pages at a time (128 KiB, this disk's `max_sectors_kb`) and each window is checked before the next read. The fixture directory was removed. Every timed call matched. Warm samples moved 0 bytes. Cold sequential samples moved exactly 67,112,960 bytes.
+
+| Id | Result | 9.2 |
+| --- | --- | --- |
+| R1 | Depth 1 median 133.1 ms. Depth 16 median 15.7 ms (8.47×). Device bytes 4.7% to 5.6% over 16 MiB. | Met |
+| S1 | Cold depth 1 median 32.4 ms, warm 21.9 ms, ratio 1.48. Warm is over 21.4 ms. Six of the seven warm samples are above that cap. Device bytes equal the file. | Not met |
+| F1 | Serial reread 5.2 ms, one pass 1.1 ms (22% of the reread). Process bytes 192,512 on both. | Met |
+| I1 | Every timed call matched. `batch_long_contiguous_run_matches_serial_reads` passed, and a corrupt page is still refused. | Met |
+| P1 | `read_page` is still one pread. Storage library tests: 277 passed, 1 ignored. Clippy `-D warnings` passed. | Met |
+
+The assigned grade stays 7.5. The checksum of 128 KiB is shorter than one device round trip, so the next read does not stay ahead, and the extra reads slow the warm pass past its cap. Do not try another window of that size. Do not retune 1.25.
+
 ## Rules for the push
 
 - Side branch only. Do not merge to `main` and do not push unless Kirby asks.
