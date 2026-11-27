@@ -105,6 +105,20 @@ Evidence: `docs/benchmarks/2026-11-26-library-prefetch.json`, ext4 on `nvme0n1`,
 
 The assigned grade stays 7.5. Cold is 0.8 ms faster than the single `pread` of the whole file, and warm is 2.7 ms slower, which is why the ratio fell from 1.48 to 1.26. The hint did not hide the device read behind the checksum. The window code is not kept. Do not retune 1.25. Do not try a third window size.
 
+## Ext4 library run, whole-run hint
+
+Evidence: `docs/benchmarks/2026-11-26-library-stream-hint.json`, ext4 on `nvme0n1`, commit `8956ef3`. A run longer than 128 KiB was hinted with `POSIX_FADV_SEQUENTIAL` and `POSIX_FADV_WILLNEED`, then read a page at a time. The fixture directory was removed. Every timed call matched. Warm samples moved 0 bytes. Cold sequential samples moved exactly 67,112,960 bytes.
+
+| Id | Result | 9.2 |
+| --- | --- | --- |
+| R1 | Depth 1 median 133.0 ms. Depth 16 median 15.6 ms (8.52×). Device bytes 5.0% to 5.7% over 16 MiB. | Met |
+| S1 | Cold depth 1 median 32.0 ms, warm 25.8 ms, ratio 1.24. Every warm sample is 25.4 ms to 26.3 ms, over 21.4 ms. Device bytes equal the file. | Not met |
+| F1 | Serial reread 4.8 ms, one pass 1.0 ms (22% of the reread). Process bytes 258,048 on both, up from 192,512 before the sticky sequential advice. | Met on this run's own comparison |
+| I1 | Every timed call matched. The streamed-run corrupt-page test passed. | Met |
+| P1 | `read_page` is still one pread. Storage library tests: 277 passed, 1 ignored. Clippy `-D warnings` passed. | Met |
+
+The assigned grade stays 7.5. The ratio is under 1.25 because warm got slower, not because cold got faster. Cold is 32.0 ms, worse than the single `pread` at 28.4 ms. `POSIX_FADV_SEQUENTIAL` also stayed set on the heap file and increased later readahead. That hint is not kept. Do not retune 1.25.
+
 ## Rules for the push
 
 - Side branch only. Do not merge to `main` and do not push unless Kirby asks.
