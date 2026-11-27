@@ -31,10 +31,11 @@ impl Engine {
     // Each returns `Ok(Some(result))` when the fast path fires, `Ok(None)`
     // when the shape isn't supported (caller falls back to generic code).
 
-    /// Aggregate sum/avg/min/max over a single fixed-size i64 column, with
-    /// an optional compiled filter predicate. Walks raw row bytes — zero
-    /// per-row allocation. Accumulates sum/avg in i128; a `sum` total that
-    /// does not fit back into i64 is a typed error, not a clamped number.
+    /// Aggregate sum/avg/min/max over a single fixed-size numeric column, with
+    /// an optional compiled filter predicate. Walks raw row bytes. Accumulates
+    /// sum/avg in i128; a `sum` total that does not fit back into i64 is a
+    /// typed error, not a clamped number. An overflow table reads that column
+    /// with [`decode_column`] and does not fetch any other column.
     pub(crate) fn agg_single_col_fast(
         &self,
         table: &str,
@@ -43,12 +44,6 @@ impl Engine {
         predicate: Option<&Expr>,
     ) -> Result<Option<QueryResult>, QueryError> {
         if self.generic_path_forced("agg-single-col") {
-            return Ok(None);
-        }
-        // Overflow safety (P0-4): this walks raw rehydrated bytes and would
-        // silently drop any row carrying a value too large to re-inline
-        // (>= 64KB), undercounting the aggregate. Fall back to the decoded path.
-        if self.catalog.table_has_overflow(table) {
             return Ok(None);
         }
         let schema = self
@@ -99,6 +94,27 @@ impl Engine {
             },
             None => None,
         };
+
+        // The v1 loops below use a byte offset that an overflow bitmap shifts,
+        // and they `return` on a short slice, which drops the row. A numeric
+        // column cannot spill. A predicate on a variable-length column stays
+        // generic: the compiled v2 fallback reports a stub as Empty. A
+        // predicate that does not compile already returned Ok(None) above.
+        if self.catalog.table_has_overflow(table) {
+            if predicate.is_some_and(|pred| expr_forces_generic_on_overflow(pred, &schema)) {
+                return Ok(None);
+            }
+            return self
+                .on_disk_numeric_agg(
+                    table,
+                    &schema,
+                    col_idx,
+                    col_type,
+                    function,
+                    compiled_pred.as_ref(),
+                )
+                .map(Some);
+        }
 
         // Mission C Phase 20b: specialize the inner loop per aggregate
         // function. The previous version ran a `match function { ... }`
@@ -388,6 +404,300 @@ impl Engine {
             _ => unreachable!("type guard above restricts to Int/Float"),
         };
         Ok(Some(result))
+    }
+
+    /// Sum/avg/min/max/count over one numeric column of a spilled table.
+    ///
+    /// Walks raw slots. [`decode_column`] reads the aggregated column.
+    /// `Value::Empty` is null: the value is skipped and the row is not.
+    /// Does not call `read_overflow_value`.
+    fn on_disk_numeric_agg(
+        &self,
+        table: &str,
+        schema: &Schema,
+        col_idx: usize,
+        col_type: TypeId,
+        function: AggFunc,
+        pred: Option<&CompiledPredicate>,
+    ) -> Result<QueryResult, QueryError> {
+        match col_type {
+            TypeId::Int => self.on_disk_int_agg(table, schema, col_idx, function, pred),
+            TypeId::Float => self.on_disk_float_agg(table, schema, col_idx, function, pred),
+            _ => unreachable!("type guard above restricts to Int/Float"),
+        }
+    }
+
+    fn on_disk_int_agg(
+        &self,
+        table: &str,
+        schema: &Schema,
+        col_idx: usize,
+        function: AggFunc,
+        pred: Option<&CompiledPredicate>,
+    ) -> Result<QueryResult, QueryError> {
+        match function {
+            AggFunc::Sum => {
+                let mut sum_i128: i128 = 0;
+                let mut seen = false;
+                self.fold_on_disk_numeric(table, schema, col_idx, pred, |value| {
+                    seen = true;
+                    sum_i128 += int_column(value) as i128;
+                })?;
+                Ok(QueryResult::Scalar(if seen {
+                    Value::Int(i64::try_from(sum_i128).map_err(|_| agg_overflow_error("sum"))?)
+                } else {
+                    Value::Empty
+                }))
+            }
+            AggFunc::Avg => {
+                let mut sum_i128: i128 = 0;
+                let mut count: i64 = 0;
+                self.fold_on_disk_numeric(table, schema, col_idx, pred, |value| {
+                    count += 1;
+                    sum_i128 += int_column(value) as i128;
+                })?;
+                if count == 0 {
+                    Ok(QueryResult::Scalar(Value::Empty))
+                } else {
+                    let avg = (sum_i128 as f64) / (count as f64);
+                    Ok(QueryResult::Scalar(Value::Float(avg)))
+                }
+            }
+            AggFunc::Min => {
+                // Presence is independent of the sentinel: i64::MAX is itself
+                // a valid non-null minimum.
+                let mut min_v = i64::MAX;
+                let mut seen = false;
+                self.fold_on_disk_numeric(table, schema, col_idx, pred, |value| {
+                    seen = true;
+                    min_v = min_v.min(int_column(value));
+                })?;
+                Ok(QueryResult::Scalar(if seen {
+                    Value::Int(min_v)
+                } else {
+                    Value::Empty
+                }))
+            }
+            AggFunc::Max => {
+                let mut max_v = i64::MIN;
+                let mut seen = false;
+                self.fold_on_disk_numeric(table, schema, col_idx, pred, |value| {
+                    seen = true;
+                    max_v = max_v.max(int_column(value));
+                })?;
+                Ok(QueryResult::Scalar(if seen {
+                    Value::Int(max_v)
+                } else {
+                    Value::Empty
+                }))
+            }
+            AggFunc::Count => {
+                let mut count: i64 = 0;
+                self.fold_on_disk_numeric(table, schema, col_idx, pred, |_value| {
+                    count += 1;
+                })?;
+                Ok(QueryResult::Scalar(Value::Int(count)))
+            }
+            AggFunc::CountDistinct => {
+                let mut seen = rustc_hash::FxHashSet::default();
+                self.fold_on_disk_numeric(table, schema, col_idx, pred, |value| {
+                    seen.insert(int_column(value));
+                })?;
+                Ok(QueryResult::Scalar(Value::Int(seen.len() as i64)))
+            }
+        }
+    }
+
+    fn on_disk_float_agg(
+        &self,
+        table: &str,
+        schema: &Schema,
+        col_idx: usize,
+        function: AggFunc,
+        pred: Option<&CompiledPredicate>,
+    ) -> Result<QueryResult, QueryError> {
+        match function {
+            AggFunc::Sum => {
+                let mut sum = CompensatedSum::default();
+                let mut count: i64 = 0;
+                self.fold_on_disk_numeric(table, schema, col_idx, pred, |value| {
+                    sum.add(float_column(value));
+                    count += 1;
+                })?;
+                if count == 0 {
+                    Ok(QueryResult::Scalar(Value::Empty))
+                } else {
+                    Ok(QueryResult::Scalar(Value::Float(sum.total())))
+                }
+            }
+            AggFunc::Avg => {
+                let mut sum = CompensatedSum::default();
+                let mut count: i64 = 0;
+                self.fold_on_disk_numeric(table, schema, col_idx, pred, |value| {
+                    sum.add(float_column(value));
+                    count += 1;
+                })?;
+                if count == 0 {
+                    Ok(QueryResult::Scalar(Value::Empty))
+                } else {
+                    Ok(QueryResult::Scalar(Value::Float(
+                        sum.total() / count as f64,
+                    )))
+                }
+            }
+            AggFunc::Min => {
+                let mut min_v: Option<f64> = None;
+                self.fold_on_disk_numeric(table, schema, col_idx, pred, |value| {
+                    let v = float_column(value);
+                    min_v = Some(match min_v {
+                        Some(m) => {
+                            if v.total_cmp(&m).is_lt() {
+                                v
+                            } else {
+                                m
+                            }
+                        }
+                        None => v,
+                    });
+                })?;
+                Ok(QueryResult::Scalar(
+                    min_v.map(Value::Float).unwrap_or(Value::Empty),
+                ))
+            }
+            AggFunc::Max => {
+                let mut max_v: Option<f64> = None;
+                self.fold_on_disk_numeric(table, schema, col_idx, pred, |value| {
+                    let v = float_column(value);
+                    max_v = Some(match max_v {
+                        Some(m) => {
+                            if v.total_cmp(&m).is_gt() {
+                                v
+                            } else {
+                                m
+                            }
+                        }
+                        None => v,
+                    });
+                })?;
+                Ok(QueryResult::Scalar(
+                    max_v.map(Value::Float).unwrap_or(Value::Empty),
+                ))
+            }
+            AggFunc::Count => {
+                let mut count: i64 = 0;
+                self.fold_on_disk_numeric(table, schema, col_idx, pred, |_value| {
+                    count += 1;
+                })?;
+                Ok(QueryResult::Scalar(Value::Int(count)))
+            }
+            AggFunc::CountDistinct => {
+                let mut seen = rustc_hash::FxHashSet::default();
+                self.fold_on_disk_numeric(table, schema, col_idx, pred, |value| {
+                    seen.insert(float_column(value).to_bits());
+                })?;
+                Ok(QueryResult::Scalar(Value::Int(seen.len() as i64)))
+            }
+        }
+    }
+
+    /// Non-null values of one column. `Value::Empty` is skipped. The row is
+    /// still visited: a fired cancel token is an error, not a partial fold.
+    fn fold_on_disk_numeric(
+        &self,
+        table: &str,
+        schema: &Schema,
+        col_idx: usize,
+        pred: Option<&CompiledPredicate>,
+        mut on_value: impl FnMut(&Value),
+    ) -> Result<(), QueryError> {
+        let layout = RowLayout::new(schema);
+        self.for_each_on_disk_slot(table, |data| {
+            if let Some(pred) = pred {
+                if !pred(data) {
+                    return;
+                }
+            }
+            let value = decode_column(schema, &layout, data, col_idx);
+            if !value.is_empty() {
+                on_value(&value);
+            }
+        })
+    }
+
+    /// Every live slot, raw on-disk bytes. No rehydrate and no skip.
+    ///
+    /// Same cancel split as [`for_each_row_raw_cancellable`]: no per-row poll
+    /// unless a token is installed, and a fired token is
+    /// [`QueryError::Cancelled`].
+    fn for_each_on_disk_slot(
+        &self,
+        table: &str,
+        mut f: impl FnMut(&[u8]),
+    ) -> Result<(), QueryError> {
+        let mut cancel = CancelCheck::new();
+        let mut cancel_err: Option<QueryError> = None;
+        let poll = crate::cancel::has_active_install();
+        self.catalog
+            .try_for_each_on_disk_row(table, |_rid, slot| {
+                if poll {
+                    if let Err(err) = cancel.tick() {
+                        cancel_err = Some(err);
+                        return ControlFlow::Break(());
+                    }
+                }
+                f(slot.bytes());
+                ControlFlow::Continue(())
+            })
+            .map_err(QueryError::from_storage_io)?;
+        match cancel_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// `count(T)` over every live slot of a spilled table.
+    pub(crate) fn count_on_disk_slots(
+        &self,
+        table: &str,
+        pred: Option<&CompiledPredicate>,
+    ) -> Result<i64, QueryError> {
+        let mut count: i64 = 0;
+        self.for_each_on_disk_slot(table, |data| {
+            if pred.is_none_or(|pred| pred(data)) {
+                count += 1;
+            }
+        })?;
+        Ok(count)
+    }
+
+    /// Filtered `count(T)` on a spilled table.
+    ///
+    /// `Ok(None)` when the predicate names a variable-length column or does
+    /// not compile. Those stay generic. A compiled v2 fallback would see a
+    /// spilled value as Empty, and `decode_selective` on raw v2 bytes would
+    /// too.
+    pub(crate) fn count_filtered_on_disk(
+        &self,
+        table: &str,
+        predicate: &Expr,
+        site: &'static str,
+    ) -> Result<Option<i64>, QueryError> {
+        let schema = self
+            .catalog
+            .schema(table)
+            .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?
+            .clone();
+        if expr_forces_generic_on_overflow(predicate, &schema) {
+            return Ok(None);
+        }
+        let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        let fast = FastLayout::new(&schema);
+        let Some(compiled) =
+            self.compile_predicate_unless_forced(site, predicate, &columns, &fast, &schema)
+        else {
+            return Ok(None);
+        };
+        self.count_on_disk_slots(table, Some(&compiled)).map(Some)
     }
 
     /// `Project(Limit(Filter(SeqScan)))`, `Project(Limit(SeqScan))`,
@@ -1061,12 +1371,12 @@ fn decode_projected_column(
     })
 }
 
-/// Whether a predicate on an overflow table must leave this fast path.
+/// Whether a predicate on an overflow table must leave the raw fast path.
 ///
 /// True when any field is variable-length ([`TypeId::Str`], [`TypeId::Bytes`],
 /// [`TypeId::Json`]) or names a column this schema does not have. Fixed
 /// columns never spill. No predicate is not this function's problem.
-fn expr_forces_generic_on_overflow(expr: &Expr, schema: &Schema) -> bool {
+pub(crate) fn expr_forces_generic_on_overflow(expr: &Expr, schema: &Schema) -> bool {
     match expr {
         Expr::Field(name) => field_forces_generic_on_overflow(schema, name),
         Expr::QualifiedField { field, .. } => field_forces_generic_on_overflow(schema, field),
@@ -1199,6 +1509,20 @@ fn order_forces_generic_on_overflow(order: &OrderClause, schema: &Schema) -> boo
         .keys
         .iter()
         .any(|key| expr_forces_generic_on_overflow(&key.expr, schema))
+}
+
+fn int_column(value: &Value) -> i64 {
+    match value {
+        Value::Int(v) => *v,
+        _ => unreachable!("int column"),
+    }
+}
+
+fn float_column(value: &Value) -> f64 {
+    match value {
+        Value::Float(v) => *v,
+        _ => unreachable!("float column"),
+    }
 }
 
 #[cfg(test)]

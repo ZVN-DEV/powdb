@@ -2561,28 +2561,30 @@ impl Engine {
                     );
                 }
                 // Fast path: count() over SeqScan.
-                // Overflow safety (P0-4): v2-capable tables use the decoded
-                // generic path (raw count drops >= 64KB rows). A count with a
-                // target column (`count(T { .v })`) counts non-null values, so
-                // it must not take this row-counting path.
+                // A raw rehydrate drops >= 64KB rows. An overflow table counts
+                // every live slot instead. A count with a target column
+                // (`count(T { .v })`) counts non-null values, so it must not
+                // take this row-counting path.
                 if *function == AggFunc::Count
                     && counts_every_row(argument.as_ref())
                     && !self.generic_path_forced("readonly:count-fast-block")
                 {
                     if let PlanNode::SeqScan { table } = input.as_ref() {
+                        // A dirty materialized view must be refreshed before
+                        // it can be counted, which needs `&mut self`. Escalate
+                        // to the write path (F3: count(View) returned stale).
+                        if self.view_registry.is_dirty(table) {
+                            return Err(QueryError::ReadonlyNeedsWrite);
+                        }
                         if !self.catalog.table_has_overflow(table) {
-                            // A dirty materialized view must be refreshed before
-                            // it can be counted, which needs `&mut self`. Escalate
-                            // to the write path (F3: count(View) returned stale).
-                            if self.view_registry.is_dirty(table) {
-                                return Err(QueryError::ReadonlyNeedsWrite);
-                            }
                             let mut count: i64 = 0;
                             for_each_row_raw_cancellable(&self.catalog, table, |_rid, _data| {
                                 count += 1;
                             })?;
                             return Ok(QueryResult::Scalar(Value::Int(count)));
                         }
+                        let count = self.count_on_disk_slots(table, None)?;
+                        return Ok(QueryResult::Scalar(Value::Int(count)));
                     }
                     if let PlanNode::Filter {
                         input: inner,
@@ -2653,6 +2655,15 @@ impl Engine {
                                         }
                                     },
                                 )?;
+                                return Ok(QueryResult::Scalar(Value::Int(count)));
+                            } else if let Some(count) = self.count_filtered_on_disk(
+                                table,
+                                predicate,
+                                "readonly:count-filter:predicate",
+                            )? {
+                                // Variable-length predicates and ones that do not
+                                // compile fall through. Do not decode_selective a
+                                // spilled column: it would see Empty.
                                 return Ok(QueryResult::Scalar(Value::Int(count)));
                             }
                         }

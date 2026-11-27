@@ -644,23 +644,25 @@ impl Engine {
                     && counts_every_row(argument.as_ref())
                     && !self.generic_path_forced("count-fast-block")
                 {
-                    // Overflow safety (P0-4): the raw `for_each_row_raw` count
-                    // drops any row too large to re-inline (>= 64KB) and would
-                    // undercount; v2-capable tables use the decoded generic path.
+                    // A raw rehydrate drops any row too large to re-inline
+                    // (>= 64KB). An overflow table counts every live slot
+                    // instead. `count(T { .id })` is not this arm.
                     if let PlanNode::SeqScan { table } = input.as_ref() {
+                        // Auto-refresh a dirty materialized view before
+                        // counting it — otherwise count(View) returns stale
+                        // data after an underlying mutation (F3).
+                        if self.view_registry.is_dirty(table) {
+                            self.refresh_view(table)?;
+                        }
                         if !self.catalog.table_has_overflow(table) {
-                            // Auto-refresh a dirty materialized view before
-                            // counting it — otherwise count(View) returns stale
-                            // data after an underlying mutation (F3).
-                            if self.view_registry.is_dirty(table) {
-                                self.refresh_view(table)?;
-                            }
                             let mut count: i64 = 0;
                             for_each_row_raw_cancellable(&self.catalog, table, |_rid, _data| {
                                 count += 1;
                             })?;
                             return Ok(QueryResult::Scalar(Value::Int(count)));
                         }
+                        let count = self.count_on_disk_slots(table, None)?;
+                        return Ok(QueryResult::Scalar(Value::Int(count)));
                     }
                     // Fast path: count() over Filter(SeqScan) — try compiled
                     // predicate first, fall back to decode_column path.
@@ -734,6 +736,15 @@ impl Engine {
                                     },
                                 )?;
 
+                                return Ok(QueryResult::Scalar(Value::Int(count)));
+                            } else if let Some(count) = self.count_filtered_on_disk(
+                                table,
+                                predicate,
+                                "count-filter:predicate",
+                            )? {
+                                // Variable-length predicates and ones that do not
+                                // compile fall through. Do not decode_selective a
+                                // spilled column: it would see Empty.
                                 return Ok(QueryResult::Scalar(Value::Int(count)));
                             }
                         }
