@@ -356,10 +356,8 @@ impl Engine {
                     tbl.get_many(chunk, 16)
                         .map_err(QueryError::from_storage_io)?
                 };
-                for row in fetched {
-                    if let Some(row) = row {
-                        rows.push(row);
-                    }
+                for row in fetched.into_iter().flatten() {
+                    rows.push(row);
                 }
             }
         } else {

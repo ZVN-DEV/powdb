@@ -1828,10 +1828,8 @@ impl Engine {
                             tbl.get_many(chunk, 16)
                                 .map_err(QueryError::from_storage_io)?
                         };
-                        for row in fetched {
-                            if let Some(row) = row {
-                                rows.push(row);
-                            }
+                        for row in fetched.into_iter().flatten() {
+                            rows.push(row);
                         }
                     }
                     return Ok(QueryResult::Rows { columns, rows });
@@ -1968,10 +1966,8 @@ impl Engine {
                                 tbl.get_many(chunk, 16)
                                     .map_err(QueryError::from_storage_io)?
                             };
-                            for row in fetched {
-                                if let Some(row) = row {
-                                    rows.push(row);
-                                }
+                            for row in fetched.into_iter().flatten() {
+                                rows.push(row);
                             }
                         }
                         return Ok(QueryResult::Rows { columns, rows });
@@ -2233,12 +2229,10 @@ impl Engine {
                                 tbl.get_many(chunk, 16)
                                     .map_err(QueryError::from_storage_io)?
                             };
-                            for full in fetched {
-                                if let Some(full) = full {
-                                    let row: Vec<Value> =
-                                        proj_indices.iter().map(|&ci| full[ci].clone()).collect();
-                                    rows.push(row);
-                                }
+                            for full in fetched.into_iter().flatten() {
+                                let row: Vec<Value> =
+                                    proj_indices.iter().map(|&ci| full[ci].clone()).collect();
+                                rows.push(row);
                             }
                         }
                         return Ok(QueryResult::Rows {
