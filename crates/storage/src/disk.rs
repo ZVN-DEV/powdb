@@ -244,9 +244,10 @@ impl DiskManager {
 /// most `depth` scoped threads sharing the positioned-I/O disk handle. Each
 /// thread groups its slice into maximal runs of ids where each id is exactly
 /// one greater than the previous. A longer run is read in windows of
-/// [`COALESCED_WINDOW_PAGES`] pages. Each window is one positioned read, then
-/// that window is verified before the next window is read, so checksum work
-/// can overlap the kernel fetching the rest of the run. A single page stays
+/// [`COALESCED_WINDOW_PAGES`] pages. Before the checksum of a window, the next
+/// window is hinted with `POSIX_FADV_WILLNEED` when one remains. A 128 KiB
+/// window lost that race: its checksum was shorter than a device round trip.
+/// A single page stays
 /// [`DiskManager::read_page`]. A gap, a duplicate, or a decreasing id is not
 /// coalesced. This is opt-in and does not change [`DiskManager::read_page`]
 /// or heap point reads. Checksums
@@ -325,17 +326,44 @@ fn read_pages_in_chunks(
     Ok(pages)
 }
 
-// 32 * 4 KiB = 128 KiB, one transfer on an NVMe whose max_sectors_kb is 128.
-// A whole-file pread returns only after every byte is in, so CRC cannot
-// overlap the device. Sequential windows leave the kernel free to read
-// ahead during the check. A different size is a different mechanism.
-const COALESCED_WINDOW_PAGES: usize = 32;
+// 2048 * 4 KiB = 8 MiB. The checksum of a 128 KiB window (measured at
+// 5524ca5) finished before the next device round trip, so cold got slower
+// and warm crossed 21.4 ms. Eight mebibytes of checksum is longer than one
+// round trip of the following window. The hint below asks for that window
+// only, during the check, so the bytes are fetched once.
+const COALESCED_WINDOW_PAGES: usize = 2048;
+
+// Hint the next window while this one is checked. A failure is ignored:
+// the following positioned read still returns the bytes. Non-Unix builds
+// have no `posix_fadvise`.
+fn advise_willneed(disk: &DiskManager, start_id: u32, pages: usize) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let offset = i64::from(start_id) * PAGE_SIZE as i64;
+        let len = pages as i64 * PAGE_SIZE as i64;
+        // Safety: the descriptor is the open heap file. The range is the next
+        // window of this contiguous run, which the following read will request.
+        unsafe {
+            libc::posix_fadvise(
+                disk.file_ref().as_raw_fd(),
+                offset,
+                len,
+                libc::POSIX_FADV_WILLNEED,
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (disk, start_id, pages);
+    }
+}
 
 // Maximal runs: each id is exactly one greater than the previous. A gap, a
 // duplicate, or a decrease starts a new run. `checked_add` refuses a wrap
 // from `u32::MAX` to 0, which is not contiguous on disk. A run longer than
-// [`COALESCED_WINDOW_PAGES`] is several windows, each verified before the
-// next read.
+// [`COALESCED_WINDOW_PAGES`] is several windows. The next window is hinted
+// before this one is checked.
 fn verify_contiguous_runs(
     disk: &DiskManager,
     ids: &[u32],
@@ -345,7 +373,8 @@ fn verify_contiguous_runs(
     let mut filled = 0;
     for run in ids.chunk_by(|prev, next| prev.checked_add(1) == Some(*next)) {
         debug_assert!(!run.is_empty());
-        for window in run.chunks(COALESCED_WINDOW_PAGES) {
+        let mut windows = run.chunks(COALESCED_WINDOW_PAGES).peekable();
+        while let Some(window) = windows.next() {
             let start_id = window[0];
             let slots = &mut output[filled..filled + window.len()];
             filled += window.len();
@@ -355,6 +384,11 @@ fn verify_contiguous_runs(
                 slots[0] = bytes;
             } else {
                 disk.read_contiguous_into(start_id, slots)?;
+            }
+            if let Some(next) = windows.peek() {
+                advise_willneed(disk, next[0], next.len());
+            }
+            if window.len() > 1 {
                 for page in slots.iter() {
                     Page::from_bytes_verified(page).map_err(io::Error::from)?;
                 }
