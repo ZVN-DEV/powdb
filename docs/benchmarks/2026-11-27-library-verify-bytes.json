@@ -1,0 +1,787 @@
+{
+  "cold_nvme_claim": "scoped to this workstation, this file, and buffered pread",
+  "fixture": {
+    "btrfs_compression": "filesystem default",
+    "depths": [
+      1,
+      4,
+      16,
+      32
+    ],
+    "distinct_row_pages": 16384,
+    "fanout_distinct_pages": 16,
+    "fanout_requests": 4096,
+    "heap_bytes": 67112960,
+    "heap_pages": 16385,
+    "payload_bytes": 2048,
+    "payload_pattern": "deterministic xorshift bytes, not ASCII",
+    "random_pages": 4096,
+    "rows": 16384,
+    "samples": 7
+  },
+  "host": {
+    "cpu": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+    "exclusive_hardware": false,
+    "filesystem": "ext4",
+    "mem_total_bytes": 134297169920
+  },
+  "measured_on": "2026-11-27",
+  "method": {
+    "checksum": "Page::verify_bytes on every fetched page, in place, with no copy into a Page",
+    "drop_caches": false,
+    "eviction": "posix_fadvise POSIX_FADV_DONTNEED on the heap inode before each cold sample",
+    "heap_reopened_after_eviction": false,
+    "io_uring": false,
+    "o_direct": false,
+    "queue_depth": "sequential_distinct at every depth, including depth 1: powdb_storage::disk::read_pages_verified (one pread per contiguous run). random_distinct depth 1, fanout_serial_reread, and fanout_packet: serial DiskManager::read_page. random_distinct depth >1: read_pages_verified",
+    "why_not_heap_open": "HeapFile::open reads every page while discovering free space"
+  },
+  "observations": [
+    {
+      "case": "sequential_distinct",
+      "cold": false,
+      "device_read_bytes": [
+        {
+          "nvme0n1": 0,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 0,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 0,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 0,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 0,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 0,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 0,
+          "nvme1n1": 0
+        }
+      ],
+      "distinct_pages": 16385,
+      "logical_bytes": 67112960,
+      "max_us": 22079.760000000002,
+      "min_us": 18861.293,
+      "output_verified": true,
+      "p50_us": 20737.325,
+      "p95_us": 22079.760000000002,
+      "physical_read_bytes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "queue_depth": 1,
+      "reader": "read_pages_verified",
+      "requested_reads": 16385,
+      "samples_us": [
+        18861.293,
+        19745.909,
+        20616.809999999998,
+        22079.760000000002,
+        21567.941,
+        20890.612999999998,
+        20737.325
+      ]
+    },
+    {
+      "case": "random_distinct",
+      "cold": false,
+      "device_read_bytes": [
+        {
+          "nvme0n1": 0,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 0,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 0,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 0,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 0,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 0,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 0,
+          "nvme1n1": 0
+        }
+      ],
+      "distinct_pages": 4096,
+      "logical_bytes": 16777216,
+      "max_us": 5514.6179999999995,
+      "min_us": 4250.6,
+      "output_verified": true,
+      "p50_us": 4696.325000000001,
+      "p95_us": 5514.6179999999995,
+      "physical_read_bytes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "queue_depth": 1,
+      "reader": "read_page",
+      "requested_reads": 4096,
+      "samples_us": [
+        5514.6179999999995,
+        4904.896,
+        4788.888,
+        4696.325000000001,
+        4508.212,
+        4328.877,
+        4250.6
+      ]
+    },
+    {
+      "case": "sequential_distinct",
+      "cold": true,
+      "device_read_bytes": [
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        }
+      ],
+      "distinct_pages": 16385,
+      "logical_bytes": 67112960,
+      "max_us": 28727.989999999998,
+      "min_us": 27758.224000000002,
+      "output_verified": true,
+      "p50_us": 28254.643,
+      "p95_us": 28727.989999999998,
+      "physical_read_bytes": [
+        67112960,
+        67112960,
+        67112960,
+        67112960,
+        67112960,
+        67112960,
+        67112960
+      ],
+      "queue_depth": 1,
+      "reader": "read_pages_verified",
+      "requested_reads": 16385,
+      "samples_us": [
+        28727.989999999998,
+        28270.795000000002,
+        28266.556,
+        27758.224000000002,
+        27793.370000000003,
+        28254.643,
+        27980.932
+      ]
+    },
+    {
+      "case": "sequential_distinct",
+      "cold": true,
+      "device_read_bytes": [
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        }
+      ],
+      "distinct_pages": 16385,
+      "logical_bytes": 67112960,
+      "max_us": 23183.827,
+      "min_us": 21777.965,
+      "output_verified": true,
+      "p50_us": 22279.603,
+      "p95_us": 23183.827,
+      "physical_read_bytes": [
+        67112960,
+        67112960,
+        67112960,
+        67112960,
+        67112960,
+        67112960,
+        67112960
+      ],
+      "queue_depth": 4,
+      "reader": "read_pages_verified",
+      "requested_reads": 16385,
+      "samples_us": [
+        23083.87,
+        22279.603,
+        21777.965,
+        21816.777,
+        21982.346999999998,
+        23183.827,
+        22391.924
+      ]
+    },
+    {
+      "case": "sequential_distinct",
+      "cold": true,
+      "device_read_bytes": [
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        }
+      ],
+      "distinct_pages": 16385,
+      "logical_bytes": 67112960,
+      "max_us": 22257.693,
+      "min_us": 21460.239999999998,
+      "output_verified": true,
+      "p50_us": 22041.377,
+      "p95_us": 22257.693,
+      "physical_read_bytes": [
+        67112960,
+        67112960,
+        67112960,
+        67112960,
+        67112960,
+        67112960,
+        67112960
+      ],
+      "queue_depth": 16,
+      "reader": "read_pages_verified",
+      "requested_reads": 16385,
+      "samples_us": [
+        21460.239999999998,
+        21608.858,
+        22257.693,
+        22231.574,
+        22055.825,
+        21954.365,
+        22041.377
+      ]
+    },
+    {
+      "case": "sequential_distinct",
+      "cold": true,
+      "device_read_bytes": [
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 67112960,
+          "nvme1n1": 0
+        }
+      ],
+      "distinct_pages": 16385,
+      "logical_bytes": 67112960,
+      "max_us": 22582.24,
+      "min_us": 21520.332,
+      "output_verified": true,
+      "p50_us": 21688.567,
+      "p95_us": 22582.24,
+      "physical_read_bytes": [
+        67112960,
+        67112960,
+        67112960,
+        67112960,
+        67112960,
+        67112960,
+        67112960
+      ],
+      "queue_depth": 32,
+      "reader": "read_pages_verified",
+      "requested_reads": 16385,
+      "samples_us": [
+        21520.332,
+        21635.248,
+        21688.567,
+        21891.066,
+        21569.795,
+        22582.24,
+        22006.622
+      ]
+    },
+    {
+      "case": "random_distinct",
+      "cold": true,
+      "device_read_bytes": [
+        {
+          "nvme0n1": 17854464,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17854464,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17854464,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17854464,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17854464,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17854464,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17854464,
+          "nvme1n1": 0
+        }
+      ],
+      "distinct_pages": 4096,
+      "logical_bytes": 16777216,
+      "max_us": 134644.084,
+      "min_us": 132237.316,
+      "output_verified": true,
+      "p50_us": 133820.321,
+      "p95_us": 134644.084,
+      "physical_read_bytes": [
+        17854464,
+        17854464,
+        17854464,
+        17854464,
+        17854464,
+        17854464,
+        17854464
+      ],
+      "queue_depth": 1,
+      "reader": "read_page",
+      "requested_reads": 4096,
+      "samples_us": [
+        132636.624,
+        132237.316,
+        132993.833,
+        133820.321,
+        134350.734,
+        134644.084,
+        134587.116
+      ]
+    },
+    {
+      "case": "random_distinct",
+      "cold": true,
+      "device_read_bytes": [
+        {
+          "nvme0n1": 17649664,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17641472,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17641472,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17633280,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17629184,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17641472,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17600512,
+          "nvme1n1": 0
+        }
+      ],
+      "distinct_pages": 4096,
+      "logical_bytes": 16777216,
+      "max_us": 41336.082,
+      "min_us": 40492.651999999995,
+      "output_verified": true,
+      "p50_us": 40698.968,
+      "p95_us": 41336.082,
+      "physical_read_bytes": [
+        17649664,
+        17641472,
+        17641472,
+        17633280,
+        17629184,
+        17641472,
+        17600512
+      ],
+      "queue_depth": 4,
+      "reader": "read_pages_verified",
+      "requested_reads": 4096,
+      "samples_us": [
+        40621.604,
+        41336.082,
+        40698.968,
+        40890.628,
+        40706.784,
+        40492.651999999995,
+        40535.031
+      ]
+    },
+    {
+      "case": "random_distinct",
+      "cold": true,
+      "device_read_bytes": [
+        {
+          "nvme0n1": 17747968,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17608704,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17657856,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17809408,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17678336,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17735680,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17653760,
+          "nvme1n1": 0
+        }
+      ],
+      "distinct_pages": 4096,
+      "logical_bytes": 16777216,
+      "max_us": 15858.187999999998,
+      "min_us": 15574.097,
+      "output_verified": true,
+      "p50_us": 15680.084,
+      "p95_us": 15858.187999999998,
+      "physical_read_bytes": [
+        17747968,
+        17608704,
+        17657856,
+        17809408,
+        17678336,
+        17735680,
+        17653760
+      ],
+      "queue_depth": 16,
+      "reader": "read_pages_verified",
+      "requested_reads": 4096,
+      "samples_us": [
+        15647.233,
+        15739.034999999998,
+        15612.618,
+        15858.187999999998,
+        15680.084,
+        15767.198,
+        15574.097
+      ]
+    },
+    {
+      "case": "random_distinct",
+      "cold": true,
+      "device_read_bytes": [
+        {
+          "nvme0n1": 17633280,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17543168,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17625088,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17539072,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17543168,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17534976,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 17674240,
+          "nvme1n1": 0
+        }
+      ],
+      "distinct_pages": 4096,
+      "logical_bytes": 16777216,
+      "max_us": 11618.329,
+      "min_us": 10965.536,
+      "output_verified": true,
+      "p50_us": 11187.19,
+      "p95_us": 11618.329,
+      "physical_read_bytes": [
+        17633280,
+        17543168,
+        17625088,
+        17539072,
+        17543168,
+        17534976,
+        17674240
+      ],
+      "queue_depth": 32,
+      "reader": "read_pages_verified",
+      "requested_reads": 4096,
+      "samples_us": [
+        11618.329,
+        11124.834,
+        11187.19,
+        11006.943,
+        10965.536,
+        11391.323,
+        11253.264000000001
+      ]
+    },
+    {
+      "case": "fanout_serial_reread",
+      "cold": true,
+      "device_read_bytes": [
+        {
+          "nvme0n1": 192512,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 192512,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 192512,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 192512,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 192512,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 192512,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 192512,
+          "nvme1n1": 0
+        }
+      ],
+      "distinct_pages": 16,
+      "logical_bytes": 16777216,
+      "max_us": 5121.752,
+      "min_us": 4476.844,
+      "output_verified": true,
+      "p50_us": 4509.354,
+      "p95_us": 5121.752,
+      "physical_read_bytes": [
+        192512,
+        192512,
+        192512,
+        192512,
+        192512,
+        192512,
+        192512
+      ],
+      "queue_depth": 1,
+      "reader": "read_page",
+      "requested_reads": 4096,
+      "samples_us": [
+        4497.503,
+        4509.354,
+        5121.752,
+        4976.289,
+        4770.253000000001,
+        4496.722,
+        4476.844
+      ]
+    },
+    {
+      "case": "fanout_packet",
+      "cold": true,
+      "device_read_bytes": [
+        {
+          "nvme0n1": 192512,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 192512,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 192512,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 77824,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 192512,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 192512,
+          "nvme1n1": 0
+        },
+        {
+          "nvme0n1": 77824,
+          "nvme1n1": 0
+        }
+      ],
+      "distinct_pages": 16,
+      "logical_bytes": 65536,
+      "max_us": 1393.9,
+      "min_us": 1018.2870000000001,
+      "output_verified": true,
+      "p50_us": 1092.415,
+      "p95_us": 1393.9,
+      "physical_read_bytes": [
+        192512,
+        192512,
+        192512,
+        192512,
+        192512,
+        192512,
+        192512
+      ],
+      "queue_depth": 1,
+      "reader": "read_page",
+      "requested_reads": 16,
+      "samples_us": [
+        1024.458,
+        1092.415,
+        1133.663,
+        1025.901,
+        1393.9,
+        1116.3709999999999,
+        1018.2870000000001
+      ]
+    }
+  ],
+  "production_integration": true,
+  "profile": "cold-buffered-page-schedule-v1"
+}

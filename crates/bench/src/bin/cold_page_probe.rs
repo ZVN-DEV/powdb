@@ -146,7 +146,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let report = json!({
         "profile": "cold-buffered-page-schedule-v1",
-        "measured_on": "2026-11-26",
+        "measured_on": "2026-11-27",
         "production_integration": true,
         "cold_nvme_claim": "scoped to this workstation, this file, and buffered pread",
         "method": {
@@ -156,7 +156,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "io_uring": false,
             "queue_depth": "sequential_distinct at every depth, including depth 1: powdb_storage::disk::read_pages_verified (one pread per contiguous run). random_distinct depth 1, fanout_serial_reread, and fanout_packet: serial DiskManager::read_page. random_distinct depth >1: read_pages_verified",
             "heap_reopened_after_eviction": false,
-            "checksum": "Page::from_bytes_verified on every fetched page",
+            "checksum": "read_pages_verified checks with Page::verify_bytes in place. The read_page path still uses Page::from_bytes_verified",
             "why_not_heap_open": "HeapFile::open reads every page while discovering free space",
         },
         "host": {

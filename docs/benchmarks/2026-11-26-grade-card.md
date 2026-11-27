@@ -147,6 +147,20 @@ Evidence: `docs/benchmarks/2026-11-26-library-pipeline.json`, ext4 on `nvme0n1`,
 
 The assigned grade stays 7.5. Cold is slower than one `pread` of the file (28.4 ms) and the ratio is worse. The helper thread did not hide the device time behind the checksum. That pipeline is not kept. Do not retune 1.25.
 
+## Ext4 library run, checksum without the discarded copy
+
+Evidence: `docs/benchmarks/2026-11-27-library-verify-bytes.json`, ext4 on `nvme0n1`, commits `49b8981` and `fc46824` on `bench/cold-page-reads`. Same fixture shape: 16,384 rows, 16,385 pages, 67,112,960 bytes, 7 samples, `posix_fadvise(DONTNEED)`, no `drop_caches`, no `O_DIRECT`. A contiguous run is still one `pread`. The batch path now calls `Page::verify_bytes` and does not copy the page into a `Page` it would drop. `HeapFile::scan` on a clean disk page does the same. Random depth 1 and both fanout cases still use `read_page` plus `Page::from_bytes_verified`. The JSON method line says every fetched page uses `verify_bytes`. That sentence is broader than the code: only `read_pages_verified` changed. The fixture directory was removed. Every timed call matched its fingerprint. Warm samples moved 0 bytes. Cold sequential samples moved exactly 67,112,960 bytes on the process counter and on `nvme0n1`. `nvme1n1` stayed at 0.
+
+| Id | Result | 9.2 |
+| --- | --- | --- |
+| R1 | Depth 1 median 133.8 ms. Depth 16 median 15.7 ms (8.53×). Device bytes 5.0% to 6.2% over 16 MiB. | Met |
+| S1 | Cold depth 1 median 28.3 ms, warm 20.7 ms, ratio 1.36. Warm median is under 21.4 ms (samples 18.9 ms to 22.1 ms). Device bytes equal the file. Depth 16 on the same reader was 22.0 ms. | Not met |
+| F1 | Serial reread 4.5 ms, one pass 1.1 ms (24% of the reread). Process bytes 192,512 on both. | Met |
+| I1 | Every timed call matched. `batch_refuses_corrupt_or_missing_pages` covers a corrupt page in the middle of a contiguous run. Storage library tests: 276 passed, 1 ignored. | Met |
+| P1 | `read_page` is still one pread. | Met |
+
+The assigned grade stays 7.5. Cold is the same as the copying one-pread sample (28.4 ms). The ratio fell because this warm median is 20.7 ms rather than 19.2 ms, not because the device read got faster. Dropping the unused page copy did not produce the 4.4 ms that only the cold run has to lose. Do not retune 1.25.
+
 ## Rules for the push
 
 - Side branch only. Do not merge to `main` and do not push unless Kirby asks.
